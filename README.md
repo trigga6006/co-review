@@ -36,21 +36,38 @@ Claude Code session       ~/.cc-codex-pairs/pair-xxx/      Background powershell
 
 Requires Windows + PowerShell 5.1+ + [Claude Code](https://claude.com/claude-code) + [OpenAI Codex CLI](https://github.com/openai/codex).
 
-1. Clone or download this repo somewhere stable:
-   ```
-   git clone https://github.com/<your-handle>/co-review.git C:\path\to\co-review
-   ```
-2. Junction it into your Claude Code skills directory (no admin needed):
-   ```cmd
-   mklink /J "%USERPROFILE%\.claude\skills\co-review" "C:\path\to\co-review"
-   ```
-   If you downloaded a zip instead of cloning, also run once:
-   ```powershell
-   Get-ChildItem "$env:USERPROFILE\.claude\skills\co-review" -Recurse | Unblock-File
-   ```
-3. **Restart Claude Code** (or open a fresh conversation) so it picks up the new skill.
+Clone the repo directly into your Claude Code skills directory:
 
-That's it. Type `/bot` in any conversation and `/co-review` should autocomplete.
+```cmd
+git clone https://github.com/trigga6006/co-review.git "%USERPROFILE%\.claude\skills\co-review"
+```
+
+Then **restart Claude Code** (or open a fresh conversation) so it picks up the new skill. Type `/co` in any conversation and `/co-review` should autocomplete.
+
+### Updating later
+
+```cmd
+cd "%USERPROFILE%\.claude\skills\co-review" && git pull
+```
+
+### If you downloaded a zip instead of cloning
+
+Windows marks downloaded files as remote, which PowerShell's execution policy may block. Run once after extracting:
+
+```powershell
+Get-ChildItem "$env:USERPROFILE\.claude\skills\co-review" -Recurse | Unblock-File
+```
+
+### Dev install (optional)
+
+If you want to hack on the skill while keeping the source somewhere else and have edits reflect live, clone wherever you like and junction it in:
+
+```cmd
+git clone https://github.com/trigga6006/co-review.git C:\your\dev\path\co-review
+mklink /J "%USERPROFILE%\.claude\skills\co-review" "C:\your\dev\path\co-review"
+```
+
+No admin needed for the junction.
 
 ## Use
 
