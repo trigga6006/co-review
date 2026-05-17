@@ -63,9 +63,13 @@ Output (last line is JSON):
 A new PowerShell window spawns **minimized** by default - visible in the taskbar but never stealing focus or overlaying the user's other windows. Tell the user the pair ID so they can spot the right taskbar icon if they want to peek.
 
 Optional flags:
+- `-CodexModel "gpt-5.5"` - which Codex model to use. Defaults to `gpt-5.5`. Override only if the user explicitly asks for a different model (e.g., "use gpt-5 instead").
+- `-CodexReasoning medium` - reasoning effort: `minimal` / `low` / `medium` / `high`. Defaults to `medium`. Bump to `high` for security audits or hard architectural reviews where Codex should think longer; drop to `low` for quick sanity checks.
 - `-WindowMode Hidden` - listener has no visible window at all (activity still visible via `~/.cc-codex-pairs/<pair-id>/listener.log` and `list-pairs.ps1`).
 - `-WindowMode Foreground` - old behavior, opens the window in the foreground. Avoid unless the user explicitly asks.
 - `-CodexTimeoutSec 1800` - max seconds to let one Codex turn run before the listener kills it and returns an error.
+
+The defaults (`gpt-5.5`, `medium`) are pinned in the skill so behavior is consistent across machines regardless of each user's `~/.codex/config.toml`. The `-m` and reasoning flags are passed explicitly to every `codex exec` call.
 
 Capture `pair_id` from the JSON line - you will need it for every other call.
 
@@ -150,3 +154,4 @@ Deletes a stopped pair directory permanently. This removes `to-codex.jsonl`, `to
 - One pair per Claude session. If the user explicitly wants two pairs in one Claude session, you can call `new-pair.ps1` twice and track two pair IDs - but that is unusual.
 - Codex runs with `--sandbox read-only` by default, so it cannot edit files. If the user wants Codex to apply suggestions directly, they will need to relax the sandbox via `codex exec --sandbox workspace-write` - but that is currently hardcoded in the listener.
 - `-CodexBin` is intended only for advanced local debugging and must point to an executable named `codex.exe` or `codex`.
+- The default Codex model is `gpt-5.5` at `medium` reasoning. As OpenAI ships new Codex models, the default in `scripts/new-pair.ps1` and `scripts/codex-listener.ps1` should be bumped manually - the skill doesn't auto-detect.

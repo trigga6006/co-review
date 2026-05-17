@@ -6,6 +6,9 @@
 param(
     [Parameter(Mandatory=$true)][string]$PairId,
     [string]$CodexBin = "",
+    [string]$CodexModel = "gpt-5.5",
+    [ValidateSet("minimal", "low", "medium", "high")]
+    [string]$CodexReasoning = "medium",
     [int]$PollIntervalSec = 2,
     [int]$CodexTimeoutSec = 1800,
     [switch]$DryRun  # echo messages without invoking codex
@@ -59,6 +62,7 @@ Write-Host "  Pair dir:    $pairDir"
 Write-Host "  Project cwd: $($meta.project_cwd)"
 Write-Host "  Task:        $($meta.task_hint)"
 Write-Host "  Codex bin:   $CodexBin"
+Write-Host "  Codex model: $CodexModel ($CodexReasoning reasoning)"
 Write-Host "  Created:     $($meta.created_at)"
 if ($DryRun) { Write-Host "  Mode:        DRY RUN (echo only, no codex calls)" -ForegroundColor Yellow }
 Write-Host ""
@@ -175,11 +179,16 @@ function Invoke-Codex {
     try {
         # All global `exec` options must come BEFORE the `resume` subcommand;
         # clap rejects `--sandbox` etc. after the subcommand name.
+        # `-m` pins the model so behavior is consistent across machines regardless
+        # of each user's ~/.codex/config.toml. `-c model_reasoning_effort=...`
+        # overrides reasoning depth the same way.
         $codexArgs = @(
             "exec",
             "--json",
             "--skip-git-repo-check",
             "--sandbox", "read-only",
+            "-m", $CodexModel,
+            "-c", "model_reasoning_effort=$CodexReasoning",
             "-C", $Cwd,
             "-o", $lastMsgFile.FullName
         )

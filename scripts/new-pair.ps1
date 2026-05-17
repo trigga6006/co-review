@@ -8,6 +8,9 @@ param(
     [string]$Task = "",
     [string]$ProjectCwd = "",
     [string]$CodexBin = "",
+    [string]$CodexModel = "gpt-5.5",
+    [ValidateSet("minimal", "low", "medium", "high")]
+    [string]$CodexReasoning = "medium",
     [int]$CodexTimeoutSec = 1800,
     [ValidateSet("Minimized", "Hidden", "Foreground")]
     [string]$WindowMode = "Minimized",
@@ -87,6 +90,8 @@ $meta = @{
     project_cwd = $ProjectCwd
     task_hint = $Task
     codex_bin = $CodexBin
+    codex_model = $CodexModel
+    codex_reasoning = $CodexReasoning
 } | ConvertTo-Json
 [System.IO.File]::WriteAllText($pairMeta, $meta, [System.Text.UTF8Encoding]::new($false))
 
@@ -113,7 +118,7 @@ if ($NoSpawn) {
     # No -ExecutionPolicy Bypass - Claude Code's classifier auto-denies it,
     # and the user's CurrentUser policy (typically RemoteSigned) is sufficient.
     $dryFlag = if ($DryRunListener) { "-DryRun" } else { "" }
-    $listenerArgsStr = "-NoExit -File `"$listenerPath`" -PairId $pairId -CodexBin `"$CodexBin`" -CodexTimeoutSec $CodexTimeoutSec $dryFlag".Trim()
+    $listenerArgsStr = "-NoExit -File `"$listenerPath`" -PairId $pairId -CodexBin `"$CodexBin`" -CodexModel `"$CodexModel`" -CodexReasoning $CodexReasoning -CodexTimeoutSec $CodexTimeoutSec $dryFlag".Trim()
 
     $startProcArgs = @{
         FilePath         = "powershell.exe"
@@ -152,6 +157,7 @@ Write-Host "[co-review] Created pair: $pairId"
 Write-Host "[co-review] Pair dir:     $pairDir"
 Write-Host "[co-review] Project cwd:  $ProjectCwd"
 Write-Host "[co-review] Codex bin:    $CodexBin"
+Write-Host "[co-review] Codex model:  $CodexModel ($CodexReasoning reasoning)"
 Write-Host "[co-review] Window:       $spawnDetail"
 Write-Host ""
 
@@ -163,5 +169,7 @@ $result = @{
     window_spawned = $spawned
     spawn_detail = $spawnDetail
     codex_bin = $CodexBin
+    codex_model = $CodexModel
+    codex_reasoning = $CodexReasoning
 } | ConvertTo-Json -Compress
 Write-Output $result
