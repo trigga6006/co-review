@@ -64,7 +64,7 @@ A new PowerShell window spawns **minimized** by default - visible in the taskbar
 
 Optional flags:
 - `-CodexModel "gpt-5.5"` - which Codex model to use. Defaults to `gpt-5.5`. Override only if the user explicitly asks for a different model (e.g., "use gpt-5 instead").
-- `-CodexReasoning medium` - reasoning effort: `minimal` / `low` / `medium` / `high`. Defaults to `medium`. Bump to `high` for security audits or hard architectural reviews where Codex should think longer; drop to `low` for quick sanity checks.
+- `-CodexReasoning medium` - reasoning effort: `low` / `medium` / `high`. Defaults to `medium`. Bump to `high` for security audits or hard architectural reviews where Codex should think longer; drop to `low` for quick sanity checks.
 - `-WindowMode Hidden` - listener has no visible window at all (activity still visible via `~/.cc-codex-pairs/<pair-id>/listener.log` and `list-pairs.ps1`).
 - `-WindowMode Foreground` - old behavior, opens the window in the foreground. Avoid unless the user explicitly asks.
 - `-CodexTimeoutSec 1800` - max seconds to let one Codex turn run before the listener kills it and returns an error.

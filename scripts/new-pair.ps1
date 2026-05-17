@@ -9,7 +9,7 @@ param(
     [string]$ProjectCwd = "",
     [string]$CodexBin = "",
     [string]$CodexModel = "gpt-5.5",
-    [ValidateSet("minimal", "low", "medium", "high")]
+    [ValidateSet("low", "medium", "high")]
     [string]$CodexReasoning = "medium",
     [int]$CodexTimeoutSec = 1800,
     [ValidateSet("Minimized", "Hidden", "Foreground")]

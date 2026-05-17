@@ -7,7 +7,7 @@ param(
     [Parameter(Mandatory=$true)][string]$PairId,
     [string]$CodexBin = "",
     [string]$CodexModel = "gpt-5.5",
-    [ValidateSet("minimal", "low", "medium", "high")]
+    [ValidateSet("low", "medium", "high")]
     [string]$CodexReasoning = "medium",
     [int]$PollIntervalSec = 2,
     [int]$CodexTimeoutSec = 1800,
