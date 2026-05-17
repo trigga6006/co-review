@@ -1,6 +1,6 @@
 ---
 name: co-review
-description: Pair the current Claude Code session with a sibling OpenAI Codex CLI session so the two agents can ping-pong without copy-paste. Spawns a background PowerShell window (minimized) running a Codex listener, wires up file-based message passing under ~/.cc-codex-pairs/<pair-id>/, and gives Claude send/recv/ask primitives. Each Claude session that runs the skill creates its OWN sibling - multiple pairs run side-by-side. Use when the user says "pair with codex", "spawn a codex sibling", "/co-review", or describes a review ping-pong workflow they want automated.
+description: Pair the current Claude Code session with a sibling OpenAI Codex CLI session so the two agents can ping-pong without copy-paste. Spawns a background PowerShell window (minimized) running a Codex listener, wires up file-based message passing under ~/.cc-codex-pairs/<pair-id>/, and gives Claude send/recv/ask primitives. Each Claude session that runs the skill creates its OWN sibling - multiple pairs run side-by-side. Use this skill whenever the user invokes "/co-review", says "pair with codex" or "spawn a codex sibling", OR is in a multi-turn task where they would benefit from sustained back-and-forth with Codex as reviewer - even if they don't explicitly name the skill. Specific triggers: a non-trivial refactor or implementation that wants a second opinion before shipping, debating two design approaches, working through a hard bug where outside perspective helps, or any situation where the user mentions wanting Codex to review or critique their work.
 ---
 
 # co-review - Claude Code <-> Codex pair workflow
@@ -9,11 +9,24 @@ You are now in a paired-session workflow. The user wants this Claude Code sessio
 
 ## When to use
 
-- User says "pair with codex", "spawn a codex sibling", or "/co-review"
-- User wants a back-and-forth review loop without copy-pasting between Claude Code and Codex
-- User has an ongoing task and wants Codex as on-demand reviewer / second opinion
+**Explicit triggers** (always invoke):
+- User types `/co-review` or says "pair with codex", "spawn a codex sibling", "have codex review this"
+- User asks to "ask codex" mid-task and the conversation looks like it will involve more than one exchange
 
-Do NOT use this for a single one-shot Codex review - the existing `codex` skill (`/codex review`, `/codex challenge`, `/codex consult`) is faster for that. `co-review` is for sustained ping-pong over many turns.
+**Implicit triggers** (invoke proactively, even without exact phrasing):
+- User finishes a non-trivial implementation, refactor, or bug fix and you sense they want a second opinion before shipping
+- User is debating between two approaches and wants outside judgment
+- User keeps copy-pasting between Claude Code and Codex manually — that is exactly the pain this skill removes
+- User is working through a hard problem over many turns and would benefit from a sustained reviewer rather than restarting context with Codex each time
+
+When in doubt, ask: "Want me to spin up a Codex sibling so we can ping-pong on this?" Better to offer than to silently leave them copy-pasting.
+
+**When NOT to use:**
+- Single one-shot Codex review (use the existing `codex` skill - `/codex review`, `/codex challenge`, `/codex consult` - it is faster for that)
+- The user wants Claude alone, not a paired review workflow
+- Simple lookups or questions that don't need a second agent
+
+`co-review` is specifically for sustained ping-pong over many turns. The setup cost (spawning a listener window) only pays off if the user will ask Codex more than once.
 
 ## Architecture (read this once, then act)
 
