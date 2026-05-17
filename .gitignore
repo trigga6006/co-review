@@ -1,0 +1,17 @@
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor scratch
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Local test artifacts (the suite cleans up, but defensive)
+/tests/tmp/
+
+# Dependency caches (none today, defensive)
+node_modules/
