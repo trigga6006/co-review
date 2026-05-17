@@ -1,5 +1,7 @@
 # co-review
 
+![co-review: Pair Claude Code with OpenAI Codex CLI](assets/social-card.png)
+
 **Pair Claude Code with a sibling OpenAI Codex CLI session. No copy-paste.**
 
 A [Claude Code skill](https://docs.claude.com/en/docs/claude-code/skills) that wires up file-based message passing between your active Claude Code conversation and a dedicated Codex CLI listener running in the background. Type `/co-review` and Claude can `ask` Codex for reviews, second opinions, or adversarial critique - and pipe the responses back into the conversation - without you ever touching the clipboard.
