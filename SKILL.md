@@ -16,7 +16,7 @@ You are now in a paired-session workflow. The user wants this Claude Code sessio
 **Implicit triggers** (invoke proactively, even without exact phrasing):
 - User finishes a non-trivial implementation, refactor, or bug fix and you sense they want a second opinion before shipping
 - User is debating between two approaches and wants outside judgment
-- User keeps copy-pasting between Claude Code and Codex manually — that is exactly the pain this skill removes
+- User keeps copy-pasting between Claude Code and Codex manually - that is exactly the pain this skill removes
 - User is working through a hard problem over many turns and would benefit from a sustained reviewer rather than restarting context with Codex each time
 
 When in doubt, ask: "Want me to spin up a Codex sibling so we can ping-pong on this?" Better to offer than to silently leave them copy-pasting.
@@ -37,6 +37,7 @@ When in doubt, ask: "Want me to spin up a Codex sibling so we can ping-pong on t
   - `pair.json` - `{ "pair_id", "created_at", "project_cwd", "task_hint" }`
   - `listener.pid` - PID of the spawned listener (written at startup, removed on exit)
   - `listener.log` - human-readable listener activity
+  - `disagreements.log` - one line per stylistic disagreement Claude demoted out of the main thread (see Disagreement protocol below). Only created when first written to.
   - JSONL message files retain full prompts and replies until archived or deleted
   - `shutdown` - touch file; listener exits cleanly when it sees this
 - **Codex window**: a new PowerShell console window (spawned minimized by default) running `codex-listener.ps1`. It polls `to-codex.jsonl`, runs `codex exec` (or `codex exec resume <thread-id>` for follow-ups), and appends responses to `to-claude.jsonl`. The window's cwd is the *project* cwd (so Codex picks up the project's `AGENTS.md`), not the pair dir.
@@ -140,7 +141,12 @@ Deletes a stopped pair directory permanently. This removes `to-codex.jsonl`, `to
    - Before claiming a task done, ask Codex to spot what you missed
    - The user may also explicitly say "ask codex"
 
-5. **Surfacing Codex's response to the user**: relay it, but be selective. If Codex's critique is wrong or out of scope, push back briefly and tell the user what you disagree with and why - do not blindly apply everything Codex says. Codex is a peer reviewer, not an authority.
+5. **Surfacing Codex's response to the user / disagreement protocol.** Relay Codex's reply, but classify any disagreement before deciding what to surface:
+
+   - **Correctness or security divergences** (Codex found a bug Claude missed, Claude disagrees that something is actually a bug, the two models reach different conclusions about whether code behaves correctly, has a vulnerability, races, leaks, breaks an invariant, or violates a contract): surface BOTH verdicts to the user explicitly, side by side. Label them `Codex:` and `Claude:`. Then add a one-line note on how to weight them. The user resolves, not you.
+   - **Stylistic or taste divergences** (naming, formatting, equivalent idiom choice, mild architectural preferences, mild verbosity, "I would have written it this way"): demote to `~/.cc-codex-pairs/<pair-id>/disagreements.log` as one line: `[ISO timestamp] [style] [one-line summary of the divergence]`. Append via `Add-Content` from the PowerShell tool. Do NOT interrupt the user with these. They can review the log later if curious.
+
+   Why this matters: the most informationally valuable property of pairing two different model families is that they fail differently. Same-family review (Opus+Opus, GPT+GPT) shares blindspots; cross-family disagreement is where the bugs neither model alone would catch fall out. If you silently arbitrate that disagreement, you delete the exact signal the user is paying setup cost to get. Style noise is the cost; behavioral/security disagreement is the payoff. Keep one, demote the other.
 
 6. **End the pair when**: user says they are done, the task is shipped, or the conversation pivots to something unrelated. Call `end-pair.ps1` to close the terminal cleanly.
 
