@@ -171,7 +171,8 @@ function Invoke-Codex {
         [string]$Prompt,
         [string]$SessionId,
         [string]$Cwd,
-        [int]$TimeoutSec
+        [int]$TimeoutSec,
+        [string]$Reasoning
     )
 
     $lastMsgFile = New-TemporaryFile
@@ -188,7 +189,7 @@ function Invoke-Codex {
             "--skip-git-repo-check",
             "--sandbox", "read-only",
             "-m", $CodexModel,
-            "-c", "model_reasoning_effort=$CodexReasoning",
+            "-c", "model_reasoning_effort=$Reasoning",
             "-C", $Cwd,
             "-o", $lastMsgFile.FullName
         )
@@ -365,7 +366,14 @@ while ($true) {
         } else {
             try {
                 $sid = $state.codex_session_id
-                $result = Invoke-Codex -Prompt $msg.content -SessionId $sid -Cwd $workDir -TimeoutSec $CodexTimeoutSec
+                # Per-ask reasoning override: if the incoming message has a `reasoning` field,
+                # use it for this turn only. Otherwise fall back to the pair-level default.
+                $effectiveReasoning = if ($msg.reasoning) { $msg.reasoning } else { $CodexReasoning }
+                if ($effectiveReasoning -ne $CodexReasoning) {
+                    Write-Host "    [co-review] Reasoning override for $($msg.id): $effectiveReasoning (pair default: $CodexReasoning)" -ForegroundColor DarkCyan
+                    Write-Log "Reasoning override on $($msg.id): $effectiveReasoning"
+                }
+                $result = Invoke-Codex -Prompt $msg.content -SessionId $sid -Cwd $workDir -TimeoutSec $CodexTimeoutSec -Reasoning $effectiveReasoning
 
                 if ($result.ExitCode -ne 0 -and [string]::IsNullOrWhiteSpace($result.Reply)) {
                     $errText = "codex exec exit=$($result.ExitCode). stderr:`n$($result.Stderr)"

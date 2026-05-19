@@ -84,6 +84,9 @@ Blocks until Codex replies (or timeout). Default timeout 600s. Matching is done 
 
 For long prompts (large diffs), use `-MessageFile <path>` instead of `-Message` to avoid command-line length limits.
 
+Optional per-ask flag:
+- `-Reasoning low|medium|high` - override the pair-level reasoning effort for just this one ask. Empty / omitted = use pair default (typically `medium`). Bump to `high` for security audits, hard correctness questions, or architectural decisions. Drop to `low` only for cheap sanity checks. Default `medium` is the right answer for most reviews - don't pre-emptively go high without a reason.
+
 ### 3. Send without blocking
 
 ```powershell
@@ -140,6 +143,13 @@ Deletes a stopped pair directory permanently. This removes `to-codex.jsonl`, `to
    - When you are unsure between two approaches, ask for opinion
    - Before claiming a task done, ask Codex to spot what you missed
    - The user may also explicitly say "ask codex"
+
+   **Reasoning level per ask:** the pair has a default reasoning effort (typically `medium`). You can override per-ask with `ask.ps1 -Reasoning <low|medium|high>`. Heuristic:
+   - `high` only when the question genuinely needs deeper thinking - security audits, hard correctness questions, architectural decisions, race/concurrency analysis. Don't reflexively reach for high - medium is the right answer for most reviews.
+   - `low` for cheap sanity checks ("does this look reasonable?", "any obvious issues?")
+   - `medium` (no override) for everything else - the default is well-tuned
+
+   **Token budget:** the user's Codex usage limits are deliberately generous - don't try to be efficient on Codex's behalf. NEVER instruct Codex to "be brief", "keep it short", "concisely", etc. If Codex wants to be thorough, that is the feature, not the bug. The whole point of paying setup cost for a Codex sibling is depth - throwing that away to save tokens defeats the workflow.
 
 5. **Surfacing Codex's response to the user / disagreement protocol.** Relay Codex's reply, but classify any disagreement before deciding what to surface:
 
