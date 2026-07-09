@@ -9,13 +9,18 @@ param(
     [string]$Model = "",
     # Optional per-turn overrides. Empty strings mean "use pair default".
     [string]$Reasoning = "",
-    [int]$TurnTimeoutSec = 0
+    [int]$TurnTimeoutSec = 0,
+    [switch]$NoEnsure
 )
 
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "common.ps1")
 
 $pairDir = Get-PairDir -PairId $PairId -MustExist
+
+if (-not $NoEnsure) {
+    & (Join-Path $PSScriptRoot "ensure-pair.ps1") -PairId $PairId -Json | Out-Null
+}
 
 if ($TurnTimeoutSec -lt 0) {
     throw "TurnTimeoutSec must be greater than zero when specified"

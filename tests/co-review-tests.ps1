@@ -476,6 +476,135 @@ function Test-CapabilityDiscovery {
     Assert-True ($capabilities.sandboxes -contains "danger-full-access") "capabilities should expose danger-full-access sandbox"
 }
 
+function Wait-ForListener {
+    param([Parameter(Mandatory=$true)][string]$PairDir, [int]$TimeoutSec = 10)
+    $pidFile = Join-Path $PairDir "listener.pid"
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        if (Test-Path -LiteralPath $pidFile) { return }
+        Start-Sleep -Milliseconds 200
+    }
+    throw "Listener did not start for $PairDir"
+}
+
+function Test-WorkerLifecycle {
+    $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("co-review-lifecycle-" + [System.Guid]::NewGuid().ToString("N"))
+    $fakeCodex = New-FakeCodex -Directory (Join-Path $tempRoot "fake")
+    $codexHome = Join-Path $tempRoot "codex-home"
+    New-Item -ItemType Directory -Path $codexHome -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $RepoRoot "tests\fixtures\models-cache.json") -Destination (Join-Path $codexHome "models_cache.json")
+    $oldCodexHome = $env:CODEX_HOME
+    $env:CODEX_HOME = $codexHome
+    $workers = @()
+    try {
+        foreach ($name in @("review-security", "review-performance")) {
+            $json = & (Join-Path $Scripts "new-worker.ps1") -Name $name -Mode review -Task "review task" -ProjectCwd $RepoRoot -Model gpt-test-frontier -Reasoning medium -CodexBin $fakeCodex -DryRunListener | Select-Object -Last 1
+            $worker = $json | ConvertFrom-Json
+            $workers += $worker
+            Assert-True ($worker.worker_id -eq $worker.pair_id) "worker output should retain the compatible pair id"
+            Wait-ForListener -PairDir $worker.pair_dir
+        }
+        Assert-True ($workers[0].worker_id -ne $workers[1].worker_id) "workers should have distinct ids"
+        $reply = & (Join-Path $Scripts "ask-worker.ps1") -WorkerId $workers[0].worker_id -Message "hello worker" -TimeoutSec 20 -RawJson | Select-Object -Last 1 | ConvertFrom-Json
+        Assert-True ($reply.content -match "hello worker") "worker ask should route through the existing queue"
+        $listed = @(& (Join-Path $Scripts "list-workers.ps1") -Json | ConvertFrom-Json)
+        Assert-True (@($listed | Where-Object { $_.name -eq "review-security" -and $_.mode -eq "review" }).Count -eq 1) "list-workers should expose worker name and mode"
+        $ensured = & (Join-Path $Scripts "ensure-worker.ps1") -WorkerId $workers[0].worker_id -Json | Select-Object -Last 1 | ConvertFrom-Json
+        Assert-True ($ensured.status -eq "active") "ensure-worker should verify a live worker"
+    } finally {
+        foreach ($worker in $workers) {
+            if (Test-Path -LiteralPath $worker.pair_dir) {
+                & (Join-Path $Scripts "end-worker.ps1") -WorkerId $worker.worker_id -Delete | Out-Null
+            }
+        }
+        $env:CODEX_HOME = $oldCodexHome
+        Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-WriterLeases {
+    $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("co-review-leases-" + [System.Guid]::NewGuid().ToString("N"))
+    $project = Join-Path $tempRoot "project"
+    $fakeCodex = New-FakeCodex -Directory (Join-Path $tempRoot "fake")
+    $codexHome = Join-Path $tempRoot "codex-home"
+    New-Item -ItemType Directory -Path $project,$codexHome -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $RepoRoot "tests\fixtures\models-cache.json") -Destination (Join-Path $codexHome "models_cache.json")
+    $oldCodexHome = $env:CODEX_HOME
+    $env:CODEX_HOME = $codexHome
+    $first = $null
+    $second = $null
+    try {
+        $first = (& (Join-Path $Scripts "new-worker.ps1") -Name writer-one -Mode workhorse -Task "write one" -ProjectCwd $project -Isolation shared -Model gpt-test-frontier -Reasoning medium -CodexBin $fakeCodex -DryRunListener | Select-Object -Last 1) | ConvertFrom-Json
+        Wait-ForListener -PairDir $first.pair_dir
+        $conflict = Invoke-ScriptExpectFailure -ScriptName "new-worker.ps1" -ScriptArgs @("-Name","writer-two","-Mode","workhorse","-Task","write two","-ProjectCwd",$project,"-Isolation","shared","-Model","gpt-test-frontier","-Reasoning","medium","-CodexBin",$fakeCodex,"-DryRunListener")
+        Assert-True ($conflict.ExitCode -ne 0) "a second shared workhorse should be rejected"
+        Assert-True ($conflict.Output -match [regex]::Escape($first.worker_id)) "lease conflict should identify the current owner"
+        & (Join-Path $Scripts "end-worker.ps1") -WorkerId $first.worker_id -Delete | Out-Null
+        $first = $null
+
+        . (Join-Path $Scripts "common.ps1")
+        $staleId = "pair-20000101-000000-dead"
+        $staleDir = Join-Path (Get-CoReviewRoot) $staleId
+        New-Item -ItemType Directory -Path $staleDir -Force | Out-Null
+        $staleLeasePath = Get-WriterLeasePath -WorkingDirectory $project
+        $staleLease = @{ pair_id=$staleId; pair_dir=$staleDir; working_directory=(Get-CanonicalDirectory $project); created_at="2000-01-01T00:00:00Z" } | ConvertTo-Json -Compress
+        [System.IO.File]::WriteAllText($staleLeasePath, $staleLease, [System.Text.UTF8Encoding]::new($false))
+        $second = (& (Join-Path $Scripts "new-worker.ps1") -Name writer-two -Mode workhorse -Task "write two" -ProjectCwd $project -Isolation shared -Model gpt-test-frontier -Reasoning medium -CodexBin $fakeCodex -DryRunListener | Select-Object -Last 1) | ConvertFrom-Json
+        Wait-ForListener -PairDir $second.pair_dir
+        $reclaimedLease = Get-Content -LiteralPath $staleLeasePath -Raw | ConvertFrom-Json
+        Assert-True ($reclaimedLease.pair_id -eq $second.worker_id) "a verified stale writer lease should be reclaimed"
+        Remove-Item -LiteralPath $staleDir -Recurse -Force -ErrorAction SilentlyContinue
+    } finally {
+        if ($null -ne $first -and (Test-Path -LiteralPath $first.pair_dir)) { & (Join-Path $Scripts "end-worker.ps1") -WorkerId $first.worker_id -Delete | Out-Null }
+        if ($null -ne $second -and (Test-Path -LiteralPath $second.pair_dir)) { & (Join-Path $Scripts "end-worker.ps1") -WorkerId $second.worker_id -Delete | Out-Null }
+        $env:CODEX_HOME = $oldCodexHome
+        Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-WorktreeIsolation {
+    $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("co-review-worktrees-" + [System.Guid]::NewGuid().ToString("N"))
+    $project = Join-Path $tempRoot "repo"
+    $fakeCodex = New-FakeCodex -Directory (Join-Path $tempRoot "fake")
+    $codexHome = Join-Path $tempRoot "codex-home"
+    New-Item -ItemType Directory -Path $project,$codexHome -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $RepoRoot "tests\fixtures\models-cache.json") -Destination (Join-Path $codexHome "models_cache.json")
+    & git -C $project init | Out-Null
+    & git -C $project config user.email "test@example.com"
+    & git -C $project config user.name "Co Review Test"
+    Set-Content -LiteralPath (Join-Path $project "tracked.txt") -Value "base" -Encoding ASCII
+    & git -C $project add tracked.txt
+    & git -C $project commit -m "base" | Out-Null
+    $oldCodexHome = $env:CODEX_HOME
+    $env:CODEX_HOME = $codexHome
+    $first = $null
+    $second = $null
+    try {
+        $first = (& (Join-Path $Scripts "new-worker.ps1") -Name writer-primary -Mode workhorse -Task "primary" -ProjectCwd $project -Isolation auto -Model gpt-test-frontier -Reasoning medium -CodexBin $fakeCodex -DryRunListener | Select-Object -Last 1) | ConvertFrom-Json
+        Wait-ForListener -PairDir $first.pair_dir
+        $second = (& (Join-Path $Scripts "new-worker.ps1") -Name writer-isolated -Mode workhorse -Task "isolated" -ProjectCwd $project -Isolation auto -Model gpt-test-frontier -Reasoning medium -CodexBin $fakeCodex -DryRunListener | Select-Object -Last 1) | ConvertFrom-Json
+        Wait-ForListener -PairDir $second.pair_dir
+        Assert-True ($first.project_cwd -eq $project) "first automatic workhorse should use the source checkout"
+        Assert-True ($second.project_cwd -ne $project) "second automatic workhorse should use an isolated worktree"
+        Assert-True (Test-Path -LiteralPath $second.project_cwd) "managed worktree should exist"
+        $secondMeta = Get-Content -LiteralPath (Join-Path $second.pair_dir "pair.json") -Raw | ConvertFrom-Json
+        Assert-True ($secondMeta.isolation -eq "worktree") "isolated metadata should record worktree isolation"
+        Assert-True (-not [string]::IsNullOrWhiteSpace([string]$secondMeta.worktree_branch)) "isolated metadata should record a branch"
+
+        Set-Content -LiteralPath (Join-Path $project "tracked.txt") -Value "dirty" -Encoding ASCII
+        $dirty = Invoke-ScriptExpectFailure -ScriptName "new-worker.ps1" -ScriptArgs @("-Name","writer-dirty","-Mode","workhorse","-Task","dirty","-ProjectCwd",$project,"-Isolation","auto","-Model","gpt-test-frontier","-Reasoning","medium","-CodexBin",$fakeCodex,"-DryRunListener")
+        Assert-True ($dirty.ExitCode -ne 0) "parallel auto isolation should reject a dirty source"
+        Assert-True ($dirty.Output -match "uncommitted|dirty") "dirty-source rejection should be actionable"
+        Assert-True ((Get-Content -LiteralPath (Join-Path $project "tracked.txt") -Raw).Trim() -eq "dirty") "failed isolation must preserve source changes"
+    } finally {
+        if ($null -ne $first -and (Test-Path -LiteralPath $first.pair_dir)) { & (Join-Path $Scripts "end-worker.ps1") -WorkerId $first.worker_id -Delete | Out-Null }
+        if ($null -ne $second -and (Test-Path -LiteralPath $second.pair_dir)) { & (Join-Path $Scripts "end-worker.ps1") -WorkerId $second.worker_id -Delete | Out-Null }
+        if ($null -ne $second -and (Test-Path -LiteralPath $second.project_cwd)) { & git -C $project worktree remove --force $second.project_cwd 2>$null | Out-Null }
+        $env:CODEX_HOME = $oldCodexHome
+        Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 $TestGroups = [ordered]@{
     PathSafety = {
         Test-InvalidPairIdsRejected
@@ -485,6 +614,9 @@ $TestGroups = [ordered]@{
     Timeout = { Test-ListenerReturnsTimeoutError }
     CapabilityDiscovery = { Test-CapabilityDiscovery }
     WorkerModes = { Test-WorkerModes }
+    WorkerLifecycle = { Test-WorkerLifecycle }
+    WriterLeases = { Test-WriterLeases }
+    WorktreeIsolation = { Test-WorktreeIsolation }
 }
 
 if ($Only) {

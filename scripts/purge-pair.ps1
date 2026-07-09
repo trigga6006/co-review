@@ -1,25 +1,13 @@
-# co-review: purge-pair.ps1
-# Permanently delete a stopped pair directory and its retained message logs.
 [CmdletBinding(SupportsShouldProcess=$true, ConfirmImpact="High")]
-param(
-    [Parameter(Mandatory=$true)][string]$PairId,
-    [switch]$Force
-)
-
+param([Parameter(Mandatory=$true)][string]$PairId, [switch]$Force)
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "common.ps1")
-
 $pairDir = Get-PairDir -PairId $PairId -MustExist
-$pidFile = Join-Path $pairDir "listener.pid"
-if (Test-Path -LiteralPath $pidFile) {
-    $raw = (Get-Content -LiteralPath $pidFile -Raw -ErrorAction SilentlyContinue).Trim()
-    if ($raw -match '^\d+$' -and (Get-Process -Id ([int]$raw) -ErrorAction SilentlyContinue)) {
-        Write-Error "Pair $PairId still has a live listener process. Run end-pair.ps1 first."
-        exit 1
-    }
-}
-
-if ($Force -or $PSCmdlet.ShouldProcess($pairDir, "Delete co-review pair directory")) {
+$meta = Get-NormalizedPairMetadata -PairDir $pairDir
+$listenerPid = $null
+if (Test-CoReviewListenerAlive -PairDir $pairDir -ListenerPid ([ref]$listenerPid)) { throw "Worker $PairId still has a live listener. Run end-pair.ps1 first." }
+if ($Force -or $PSCmdlet.ShouldProcess($pairDir, "Delete co-review worker directory")) {
+    if ([string]$meta.mode -eq "workhorse") { Release-WriterLease -PairId $PairId -WorkingDirectory ([string]$meta.project_cwd) }
     Remove-Item -LiteralPath $pairDir -Recurse -Force
-    Write-Host "[co-review] Deleted pair dir $pairDir" -ForegroundColor Yellow
+    Write-Host "[co-review] Deleted worker $PairId"
 }

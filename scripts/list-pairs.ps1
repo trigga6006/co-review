@@ -1,105 +1,41 @@
-# co-review: list-pairs.ps1
-# Show all pair dirs with status. Useful for recovery if Claude lost the pair ID.
+# List legacy pairs and schema-v2 workers.
 [CmdletBinding()]
-param(
-    [switch]$IncludeArchived,
-    [switch]$Json
-)
-
+param([switch]$IncludeArchived, [switch]$Json)
 $ErrorActionPreference = "Continue"
-$root = Join-Path -Path $env:USERPROFILE -ChildPath ".cc-codex-pairs"
-
-if (-not (Test-Path $root)) {
-    Write-Host "[co-review] No pairs yet (no $root directory)." -ForegroundColor DarkGray
-    if ($Json) { Write-Output "[]" }
+. (Join-Path $PSScriptRoot "common.ps1")
+$root = Get-CoReviewRoot
+if (-not (Test-Path -LiteralPath $root)) {
+    if ($Json) { Write-Output "[]" } else { Write-Host "[co-review] No workers yet." }
     return
 }
-
-$dirs = Get-ChildItem -Path $root -Directory -ErrorAction SilentlyContinue | Where-Object {
-    $_.Name -like "pair-*"
-}
-
 $results = @()
-foreach ($d in $dirs) {
-    $meta = $null
-    $metaFile = Join-Path $d.FullName "pair.json"
-    if (Test-Path $metaFile) {
-        try { $meta = Get-Content $metaFile -Raw | ConvertFrom-Json } catch {}
-    }
-    $toCodex = Join-Path $d.FullName "to-codex.jsonl"
-    $toClaude = Join-Path $d.FullName "to-claude.jsonl"
-    $shutdown = Join-Path $d.FullName "shutdown"
-    $logFile = Join-Path $d.FullName "listener.log"
-    $pidFile = Join-Path $d.FullName "listener.pid"
-
-    $sentCount = 0
-    $replyCount = 0
-    if (Test-Path $toCodex)  { $sentCount  = (@(Get-Content $toCodex  -ErrorAction SilentlyContinue) | Where-Object { $_ -and $_.Trim() }).Count }
-    if (Test-Path $toClaude) { $replyCount = (@(Get-Content $toClaude -ErrorAction SilentlyContinue) | Where-Object { $_ -and $_.Trim() }).Count }
-
-    $lastLog = "(no log)"
-    if (Test-Path $logFile) {
-        # Cast to [string] - PS5.1 attaches PSPath/PSDrive/PSProvider note properties
-        # to Get-Content output that pollute ConvertTo-Json with PowerShell metadata.
-        $lastLine = [string](Get-Content $logFile -Tail 1 -ErrorAction SilentlyContinue)
-        if (-not [string]::IsNullOrWhiteSpace($lastLine)) { $lastLog = $lastLine }
-    }
-
-    # Liveness: check listener PID is still alive
+foreach ($dir in @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "pair-*" })) {
+    try { $meta = Get-NormalizedPairMetadata -PairDir $dir.FullName } catch { continue }
+    try { $state = Get-Content -LiteralPath (Join-Path $dir.FullName "state.json") -Raw | ConvertFrom-Json } catch { $state = $null }
     $listenerPid = $null
-    $listenerAlive = $false
-    if (Test-Path $pidFile) {
-        try {
-            $raw = (Get-Content $pidFile -Raw -ErrorAction Stop).Trim()
-            if ($raw -match '^\d+$') {
-                $listenerPid = [int]$raw
-                $proc = Get-Process -Id $listenerPid -ErrorAction SilentlyContinue
-                if ($proc) { $listenerAlive = $true }
-            }
-        } catch {}
+    $alive = Test-CoReviewListenerAlive -PairDir $dir.FullName -ListenerPid ([ref]$listenerPid)
+    $status = if (-not $alive) { "dead" } elseif (Test-Path -LiteralPath (Join-Path $dir.FullName "shutdown")) { "shutdown-pending" } else { "active" }
+    $leasePath = $null
+    $hasLease = $false
+    if ([string]$meta.mode -eq "workhorse" -and (Test-Path -LiteralPath ([string]$meta.project_cwd) -PathType Container)) {
+        $leasePath = Get-WriterLeasePath -WorkingDirectory ([string]$meta.project_cwd)
+        if (Test-Path -LiteralPath $leasePath) {
+            try { $lease = Get-Content -LiteralPath $leasePath -Raw | ConvertFrom-Json; $hasLease = ([string]$lease.pair_id -eq $dir.Name) } catch {}
+        }
     }
-
-    $status = if (-not $listenerAlive) { "dead" }
-              elseif (Test-Path $shutdown) { "shutdown-pending" }
-              else { "active" }
-
+    $lastActivity = [string]$meta.created_at
+    foreach ($fileName in @("to-codex.jsonl", "to-claude.jsonl", "listener.log")) {
+        $file = Get-Item -LiteralPath (Join-Path $dir.FullName $fileName) -ErrorAction SilentlyContinue
+        if ($null -ne $file -and $file.LastWriteTimeUtc -gt [DateTime]::Parse($lastActivity).ToUniversalTime()) { $lastActivity = $file.LastWriteTimeUtc.ToString("o") }
+    }
     $results += [PSCustomObject]@{
-        pair_id      = $d.Name
-        pair_dir     = $d.FullName
-        created      = if ($meta) { $meta.created_at } else { $d.CreationTime.ToString("o") }
-        project_cwd  = if ($meta) { $meta.project_cwd } else { "" }
-        task_hint    = if ($meta) { $meta.task_hint } else { "" }
-        sent_to_codex   = $sentCount
-        replies_from_codex = $replyCount
-        listener_pid = $listenerPid
-        status       = $status
-        last_log     = $lastLog
+        pair_id=$dir.Name; pair_dir=$dir.FullName; worker_name=[string]$meta.worker_name; schema_version=[int]$meta.schema_version
+        created_at=[string]$meta.created_at; project_cwd=[string]$meta.project_cwd; source_project_cwd=[string]$meta.source_project_cwd
+        task_hint=[string]$meta.task_hint; mode=[string]$meta.mode; sandbox=[string]$meta.sandbox; isolation=[string]$meta.isolation
+        codex_model=[string]$meta.codex_model; codex_reasoning=[string]$meta.codex_reasoning; listener_pid=$listenerPid; status=$status
+        codex_session_id=if($state){[string]$state.codex_session_id}else{""}; writer_lease=$hasLease; last_activity=$lastActivity
     }
 }
-
-# Sort newest first
-$results = $results | Sort-Object created -Descending
-
-if ($Json) {
-    $results | ConvertTo-Json -Depth 5
-} else {
-    if ($results.Count -eq 0) {
-        Write-Host "[co-review] No pairs found." -ForegroundColor DarkGray
-        return
-    }
-    Write-Host ""
-    Write-Host "=== co-review pairs ===" -ForegroundColor Cyan
-    foreach ($r in $results) {
-        Write-Host ""
-        Write-Host "  $($r.pair_id)" -ForegroundColor Yellow -NoNewline
-        $color = switch ($r.status) { "active" { "Green" } "dead" { "Red" } default { "Yellow" } }
-        Write-Host "  [$($r.status)]" -ForegroundColor $color
-        Write-Host "    created:    $($r.created)"
-        Write-Host "    project:    $($r.project_cwd)"
-        Write-Host "    task:       $($r.task_hint)"
-        Write-Host "    listener:   pid=$($r.listener_pid) status=$($r.status)"
-        Write-Host "    traffic:    claude->codex=$($r.sent_to_codex)  codex->claude=$($r.replies_from_codex)"
-        Write-Host "    last log:   $($r.last_log)" -ForegroundColor DarkGray
-    }
-    Write-Host ""
-}
+$results = @($results | Sort-Object created_at -Descending)
+if ($Json) { ConvertTo-Json -InputObject $results -Depth 8 }
+else { $results | Format-Table pair_id,worker_name,mode,isolation,codex_model,codex_reasoning,status -AutoSize }

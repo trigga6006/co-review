@@ -272,6 +272,9 @@ Implement the bounded task in the working directory, run verification appropriat
 - verification commands and results
 - remaining blockers or risks
 "@
+        if ([string]$Meta.isolation -eq "worktree") {
+            $contract += "`nThis is an isolated managed Git worktree. Commit the verified bounded change to its dedicated branch; Claude will review and integrate it.`n"
+        }
     } else {
         $contract = @"
 Inspect the requested scope and return an evidence-backed review. You MUST NOT edit files.
@@ -298,4 +301,187 @@ $($contract.Trim())
 TASK FROM CLAUDE:
 $Task
 "@
+}
+
+function Get-NormalizedPairMetadata {
+    param([Parameter(Mandatory=$true)][string]$PairDir)
+
+    $metaPath = Join-Path $PairDir "pair.json"
+    if (-not (Test-Path -LiteralPath $metaPath -PathType Leaf)) {
+        throw "pair.json not found at $metaPath"
+    }
+    $meta = Get-Content -LiteralPath $metaPath -Raw | ConvertFrom-Json
+    $schemaVersion = if ($meta.schema_version -ge 2) { [int]$meta.schema_version } else { 1 }
+    if ($schemaVersion -eq 1) {
+        $meta | Add-Member -NotePropertyName schema_version -NotePropertyValue 1 -Force
+        $meta | Add-Member -NotePropertyName worker_name -NotePropertyValue ([string]$meta.pair_id) -Force
+        $meta | Add-Member -NotePropertyName mode -NotePropertyValue "review" -Force
+        $meta | Add-Member -NotePropertyName sandbox -NotePropertyValue "read-only" -Force
+        $meta | Add-Member -NotePropertyName isolation -NotePropertyValue "shared" -Force
+        $meta | Add-Member -NotePropertyName window_mode -NotePropertyValue "Minimized" -Force
+        $meta | Add-Member -NotePropertyName codex_timeout_sec -NotePropertyValue 1800 -Force
+        $meta | Add-Member -NotePropertyName dry_run_listener -NotePropertyValue $false -Force
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$meta.worker_name)) {
+        $meta | Add-Member -NotePropertyName worker_name -NotePropertyValue ([string]$meta.pair_id) -Force
+    }
+    return $meta
+}
+
+function Test-CoReviewListenerAlive {
+    param(
+        [Parameter(Mandatory=$true)][string]$PairDir,
+        [ref]$ListenerPid
+    )
+
+    if ($null -ne $ListenerPid) { $ListenerPid.Value = $null }
+    $pidFile = Join-Path $PairDir "listener.pid"
+    if (-not (Test-Path -LiteralPath $pidFile -PathType Leaf)) { return $false }
+    try {
+        $raw = (Get-Content -LiteralPath $pidFile -Raw -ErrorAction Stop).Trim()
+        if ($raw -notmatch '^\d+$') { return $false }
+        $pidValue = [int]$raw
+        $proc = Get-CimInstance Win32_Process -Filter "ProcessId = $pidValue" -ErrorAction SilentlyContinue
+        if ($null -eq $proc) { return $false }
+        $pairId = Split-Path $PairDir -Leaf
+        $commandLine = [string]$proc.CommandLine
+        if ($commandLine -notmatch 'codex-listener\.ps1' -or $commandLine -notmatch [regex]::Escape($pairId)) {
+            return $false
+        }
+        if ($null -ne $ListenerPid) { $ListenerPid.Value = $pidValue }
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Start-CoReviewListener {
+    param(
+        [Parameter(Mandatory=$true)][string]$PairId,
+        [Parameter(Mandatory=$true)][string]$PairDir,
+        [string]$WindowMode = "",
+        [int]$StartupWaitSec = 10
+    )
+
+    $meta = Get-NormalizedPairMetadata -PairDir $PairDir
+    if ([string]::IsNullOrWhiteSpace($WindowMode)) { $WindowMode = [string]$meta.window_mode }
+    if ($WindowMode -notin @("Hidden", "Minimized", "Foreground")) { throw "Invalid window mode '$WindowMode'" }
+    $projectCwd = [string]$meta.project_cwd
+    if ([string]::IsNullOrWhiteSpace($projectCwd) -or -not (Test-Path -LiteralPath $projectCwd -PathType Container)) {
+        throw "Worker working directory does not exist: $projectCwd"
+    }
+    Assert-ValidCodexBin -CodexBin ([string]$meta.codex_bin)
+    $listenerPath = Join-Path $PSScriptRoot "codex-listener.ps1"
+    $arguments = @("-NoProfile", "-File", $listenerPath, "-PairId", $PairId, "-CodexBin", [string]$meta.codex_bin)
+    if ($meta.dry_run_listener -eq $true) { $arguments += "-DryRun" }
+    $process = Start-Process -FilePath "powershell.exe" -ArgumentList $arguments -WorkingDirectory $projectCwd -WindowStyle $WindowMode -PassThru -ErrorAction Stop
+
+    $listenerPid = $null
+    $deadline = (Get-Date).AddSeconds($StartupWaitSec)
+    while ((Get-Date) -lt $deadline) {
+        if (Test-CoReviewListenerAlive -PairDir $PairDir -ListenerPid ([ref]$listenerPid)) { break }
+        if ($process.HasExited) { throw "Listener process exited during startup for $PairId" }
+        Start-Sleep -Milliseconds 200
+    }
+    return [PSCustomObject]@{
+        spawned = $true
+        spawn_detail = "powershell ($WindowMode)"
+        listener_pid = $listenerPid
+        process_id = $process.Id
+    }
+}
+
+function Get-CanonicalDirectory {
+    param([Parameter(Mandatory=$true)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) { throw "Directory does not exist: $Path" }
+    return [System.IO.Path]::GetFullPath((Resolve-Path -LiteralPath $Path).Path).TrimEnd('\').ToLowerInvariant()
+}
+
+function Get-WriterLeasePath {
+    param([Parameter(Mandatory=$true)][string]$WorkingDirectory)
+    $canonical = Get-CanonicalDirectory -Path $WorkingDirectory
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($canonical)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { $hash = ([System.BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant() }
+    finally { $sha.Dispose() }
+    $leaseRoot = Join-Path (Get-CoReviewRoot) ".leases"
+    return (Join-Path $leaseRoot "$hash.json")
+}
+
+function Test-WriterLeaseOwnerLive {
+    param([Parameter(Mandatory=$true)]$Lease)
+    $ownerPairDir = [string]$Lease.pair_dir
+    if ([string]::IsNullOrWhiteSpace($ownerPairDir) -or -not (Test-Path -LiteralPath $ownerPairDir -PathType Container)) { return $false }
+    $listenerPid = $null
+    if (Test-CoReviewListenerAlive -PairDir $ownerPairDir -ListenerPid ([ref]$listenerPid)) { return $true }
+    try {
+        $created = [DateTimeOffset]::Parse([string]$Lease.created_at)
+        if (([DateTimeOffset]::Now - $created).TotalSeconds -lt 15) { return $true }
+    } catch {}
+    return $false
+}
+
+function Try-AcquireWriterLease {
+    param(
+        [Parameter(Mandatory=$true)][string]$PairId,
+        [Parameter(Mandatory=$true)][string]$PairDir,
+        [Parameter(Mandatory=$true)][string]$WorkingDirectory
+    )
+
+    $canonical = Get-CanonicalDirectory -Path $WorkingDirectory
+    $leasePath = Get-WriterLeasePath -WorkingDirectory $canonical
+    New-Item -ItemType Directory -Path (Split-Path $leasePath -Parent) -Force | Out-Null
+    for ($attempt = 0; $attempt -lt 3; $attempt++) {
+        if (Test-Path -LiteralPath $leasePath -PathType Leaf) {
+            try { $existing = Get-Content -LiteralPath $leasePath -Raw | ConvertFrom-Json } catch { $existing = $null }
+            if ($null -ne $existing -and [string]$existing.pair_id -eq $PairId) {
+                return [PSCustomObject]@{ acquired = $true; lease_path = $leasePath; owner = $existing }
+            }
+            if ($null -ne $existing -and (Test-WriterLeaseOwnerLive -Lease $existing)) {
+                return [PSCustomObject]@{ acquired = $false; lease_path = $leasePath; owner = $existing }
+            }
+            Remove-Item -LiteralPath $leasePath -Force -ErrorAction SilentlyContinue
+        }
+
+        $lease = [ordered]@{
+            pair_id = $PairId
+            pair_dir = $PairDir
+            working_directory = $canonical
+            created_at = (Get-Date).ToString("o")
+        }
+        $json = $lease | ConvertTo-Json -Compress
+        try {
+            $stream = [System.IO.File]::Open($leasePath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+            try {
+                $data = [System.Text.Encoding]::UTF8.GetBytes($json)
+                $stream.Write($data, 0, $data.Length)
+            } finally { $stream.Dispose() }
+            return [PSCustomObject]@{ acquired = $true; lease_path = $leasePath; owner = [PSCustomObject]$lease }
+        } catch [System.IO.IOException] {
+            Start-Sleep -Milliseconds 50
+        }
+    }
+    throw "Could not acquire writer lease for $canonical"
+}
+
+function Acquire-WriterLease {
+    param(
+        [Parameter(Mandatory=$true)][string]$PairId,
+        [Parameter(Mandatory=$true)][string]$PairDir,
+        [Parameter(Mandatory=$true)][string]$WorkingDirectory
+    )
+    $result = Try-AcquireWriterLease -PairId $PairId -PairDir $PairDir -WorkingDirectory $WorkingDirectory
+    if (-not $result.acquired) {
+        throw "Writer lease conflict for '$WorkingDirectory': owned by $([string]$result.owner.pair_id)"
+    }
+    return $result
+}
+
+function Release-WriterLease {
+    param([Parameter(Mandatory=$true)][string]$PairId, [Parameter(Mandatory=$true)][string]$WorkingDirectory)
+    if ([string]::IsNullOrWhiteSpace($WorkingDirectory) -or -not (Test-Path -LiteralPath $WorkingDirectory -PathType Container)) { return }
+    $leasePath = Get-WriterLeasePath -WorkingDirectory $WorkingDirectory
+    if (-not (Test-Path -LiteralPath $leasePath -PathType Leaf)) { return }
+    try { $lease = Get-Content -LiteralPath $leasePath -Raw | ConvertFrom-Json } catch { return }
+    if ([string]$lease.pair_id -eq $PairId) { Remove-Item -LiteralPath $leasePath -Force -ErrorAction SilentlyContinue }
 }
