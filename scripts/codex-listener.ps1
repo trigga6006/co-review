@@ -47,10 +47,34 @@ if ([string]::IsNullOrWhiteSpace($CodexReasoning)) { $CodexReasoning = [string]$
 if ($CodexTimeoutSec -le 0) {
     $CodexTimeoutSec = if ($meta.codex_timeout_sec -gt 0) { [int]$meta.codex_timeout_sec } else { 1800 }
 }
-$workerMode = [string]$meta.mode
-if ([string]::IsNullOrWhiteSpace($workerMode)) { $workerMode = "review" }
-$workerSandbox = [string]$meta.sandbox
-if ([string]::IsNullOrWhiteSpace($workerSandbox)) { $workerSandbox = "read-only" }
+$schemaVersion = if ($meta.schema_version -ge 2) { [int]$meta.schema_version } else { 1 }
+if ($schemaVersion -eq 1) {
+    $workerMode = "review"
+    $workerSandbox = "read-only"
+    $workerIsolation = "shared"
+} else {
+    $workerMode = [string]$meta.mode
+    $workerSandbox = [string]$meta.sandbox
+    $workerIsolation = [string]$meta.isolation
+}
+
+$metadataError = ""
+if ($workerMode -notin @("review", "workhorse")) {
+    $metadataError = "Invalid worker mode '$workerMode' in schema-v$schemaVersion pair metadata"
+} elseif ($workerSandbox -notin @("read-only", "workspace-write", "danger-full-access")) {
+    $metadataError = "Invalid worker sandbox '$workerSandbox' in schema-v$schemaVersion pair metadata"
+} elseif ($workerMode -eq "review" -and $workerSandbox -ne "read-only") {
+    $metadataError = "Review workers must use the read-only sandbox"
+}
+if ($metadataError) {
+    Write-Host "[co-review] FATAL: $metadataError" -ForegroundColor Red
+    Remove-Item -ErrorAction SilentlyContinue $pidFile
+    exit 1
+}
+
+$meta | Add-Member -NotePropertyName mode -NotePropertyValue $workerMode -Force
+$meta | Add-Member -NotePropertyName sandbox -NotePropertyValue $workerSandbox -Force
+$meta | Add-Member -NotePropertyName isolation -NotePropertyValue $workerIsolation -Force
 $workerProfile = [string]$meta.profile
 $workerAddDirs = @($meta.add_dirs | ForEach-Object { [string]$_ })
 $workerSearch = ($meta.search_enabled -eq $true)

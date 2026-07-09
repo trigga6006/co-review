@@ -9,7 +9,6 @@ param(
     [string]$ProjectCwd = "",
     [string]$CodexBin = "",
     [string]$CodexModel = "gpt-5.5",
-    [ValidateSet("low", "medium", "high")]
     [string]$CodexReasoning = "medium",
     [int]$CodexTimeoutSec = 1800,
     [ValidateSet("Minimized", "Hidden", "Foreground")]
@@ -86,6 +85,13 @@ foreach ($dir in $AddDir) {
     $resolvedAddDirs += (Resolve-Path -LiteralPath $dir).Path
 }
 
+$requestedCodexModel = $CodexModel
+$requestedCodexReasoning = $CodexReasoning
+$capabilities = Get-CodexCapabilities -CodexBin $CodexBin
+$selection = Resolve-CodexSelection -Capabilities $capabilities -Model $requestedCodexModel -Reasoning $requestedCodexReasoning
+$CodexModel = [string]$selection.model
+$CodexReasoning = [string]$selection.reasoning
+
 # Generate pair id: pair-<yyyymmdd>-<4 hex>
 $timestamp = (Get-Date).ToString("yyyyMMdd-HHmmss")
 $randHex = -join ((1..4) | ForEach-Object { "{0:x}" -f (Get-Random -Maximum 16) })
@@ -125,9 +131,9 @@ $meta = @{
     sandbox = $Sandbox
     isolation = $Isolation
     codex_bin = $CodexBin
-    requested_model = $CodexModel
+    requested_model = $requestedCodexModel
     codex_model = $CodexModel
-    requested_reasoning = $CodexReasoning
+    requested_reasoning = $requestedCodexReasoning
     codex_reasoning = $CodexReasoning
     config_overrides = @($ConfigOverride)
     profile = $Profile

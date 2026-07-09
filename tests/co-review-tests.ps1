@@ -197,6 +197,44 @@ function Invoke-WorkerModeTurn {
     }
 }
 
+function Assert-TamperedPairRejected {
+    param(
+        [Parameter(Mandatory=$true)]$Pair,
+        [Parameter(Mandatory=$true)][string]$FakeCodex,
+        [Parameter(Mandatory=$true)][string]$CaptureDir
+    )
+
+    New-Item -ItemType Directory -Path $CaptureDir -Force | Out-Null
+    $argsPath = Join-Path $CaptureDir "args.txt"
+    $stdinPath = Join-Path $CaptureDir "stdin.txt"
+    $stdoutPath = Join-Path $CaptureDir "listener-stdout.txt"
+    $stderrPath = Join-Path $CaptureDir "listener-stderr.txt"
+    $oldArgsPath = $env:CO_REVIEW_TEST_ARGS
+    $oldStdinPath = $env:CO_REVIEW_TEST_STDIN
+    $env:CO_REVIEW_TEST_ARGS = $argsPath
+    $env:CO_REVIEW_TEST_STDIN = $stdinPath
+
+    $listener = Start-Process powershell.exe -ArgumentList @(
+        "-NoProfile",
+        "-NonInteractive",
+        "-File", (Join-Path $Scripts "codex-listener.ps1"),
+        "-PairId", $Pair.pair_id,
+        "-CodexBin", $FakeCodex,
+        "-PollIntervalSec", "1"
+    ) -WindowStyle Hidden -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -PassThru
+    try {
+        $exited = $listener.WaitForExit(5000)
+        Assert-True $exited "listener should reject invalid schema-v2 mode/sandbox metadata"
+        $listenerOutput = ((Get-Content -LiteralPath $stdoutPath -Raw -ErrorAction SilentlyContinue) + (Get-Content -LiteralPath $stderrPath -Raw -ErrorAction SilentlyContinue))
+        Assert-True ($listenerOutput -match "review.*read-only") "listener should explain the fixed review sandbox boundary"
+        Assert-True (-not (Test-Path -LiteralPath $argsPath)) "listener should reject tampered metadata before invoking Codex"
+    } finally {
+        if (-not $listener.HasExited) { Stop-Process -Id $listener.Id -Force }
+        $env:CO_REVIEW_TEST_ARGS = $oldArgsPath
+        $env:CO_REVIEW_TEST_STDIN = $oldStdinPath
+    }
+}
+
 function Test-WorkerModes {
     $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("co-review-worker-modes-" + [System.Guid]::NewGuid().ToString("N"))
     $fakeDir = Join-Path $tempRoot "fake"
@@ -209,6 +247,7 @@ function Test-WorkerModes {
     $env:CODEX_HOME = $codexHome
     $review = $null
     $workhorse = $null
+    $tampered = $null
 
     try {
         $reviewJson = & (Join-Path $Scripts "new-pair.ps1") -NoSpawn -Task "review task" -WorkerName "reviewer" -Mode review -CodexBin $fakeCodex -CodexModel "gpt-test-frontier" -CodexReasoning medium | Select-Object -Last 1
@@ -219,9 +258,9 @@ function Test-WorkerModes {
         Assert-True ($reviewMeta.mode -eq "review") "review pairs should persist review mode"
         Assert-True ($reviewMeta.sandbox -eq "read-only") "review pairs should default to read-only"
         Assert-True ($reviewMeta.isolation -eq "shared") "legacy pair creation should default to shared isolation"
-        Assert-True ($reviewMeta.requested_model -eq "gpt-test-frontier") "pair metadata should persist the requested model"
+        Assert-True ($reviewMeta.requested_model -eq "gpt-test-frontier") "pair metadata should preserve the requested model"
         Assert-True ($reviewMeta.codex_model -eq "gpt-test-frontier") "pair metadata should persist the effective model"
-        Assert-True ($reviewMeta.requested_reasoning -eq "medium") "pair metadata should persist requested reasoning"
+        Assert-True ($reviewMeta.requested_reasoning -eq "medium") "pair metadata should preserve requested reasoning"
         Assert-True ($reviewMeta.codex_reasoning -eq "medium") "pair metadata should persist effective reasoning"
 
         $reviewTurn = Invoke-WorkerModeTurn -Pair $review -FakeCodex $fakeCodex -CaptureDir (Join-Path $tempRoot "review-capture") -Message "inspect this change" -Model "gpt-test-frontier" -Reasoning "xhigh" -TurnTimeoutSec 17
@@ -239,11 +278,13 @@ function Test-WorkerModes {
         Assert-True ($reviewTurn.Queue.reasoning -eq "xhigh") "queue should persist dynamic xhigh reasoning"
         Assert-True ($reviewTurn.Queue.turn_timeout_sec -eq 17) "queue should persist the Codex turn timeout separately"
 
-        $workhorseJson = & (Join-Path $Scripts "new-pair.ps1") -NoSpawn -Task "implementation task" -WorkerName "builder" -Mode workhorse -CodexBin $fakeCodex -CodexModel "gpt-test-frontier" -CodexReasoning medium -Search -AddDir $extraDir -Profile "test-profile" -ConfigOverride "features.web_search=true" | Select-Object -Last 1
+        $workhorseJson = & (Join-Path $Scripts "new-pair.ps1") -NoSpawn -Task "implementation task" -WorkerName "builder" -Mode workhorse -CodexBin $fakeCodex -CodexModel "gpt-test-frontier" -CodexReasoning xhigh -Search -AddDir $extraDir -Profile "test-profile" -ConfigOverride "features.web_search=true" | Select-Object -Last 1
         $workhorse = $workhorseJson | ConvertFrom-Json
         $workhorseMeta = Get-Content -LiteralPath (Join-Path $workhorse.pair_dir "pair.json") -Raw | ConvertFrom-Json
         Assert-True ($workhorseMeta.mode -eq "workhorse") "workhorse pairs should persist workhorse mode"
         Assert-True ($workhorseMeta.sandbox -eq "workspace-write") "workhorse pairs should default to workspace-write"
+        Assert-True ($workhorseMeta.requested_reasoning -eq "xhigh") "pair metadata should preserve an advertised explicit xhigh default"
+        Assert-True ($workhorseMeta.codex_reasoning -eq "xhigh") "pair metadata should resolve an advertised xhigh default"
         Assert-True ($workhorseMeta.search_enabled -eq $true) "pair metadata should persist search enablement"
         Assert-True (@($workhorseMeta.config_overrides) -contains "features.web_search=true") "pair metadata should persist safe config overrides"
 
@@ -252,14 +293,17 @@ function Test-WorkerModes {
         $workhorseExec = [Array]::IndexOf($workhorseTurn.Args, "exec")
         $workhorseSandbox = [Array]::IndexOf($workhorseTurn.Args, "--sandbox")
         Assert-True ($workhorseTurn.Args[0] -eq "-a" -and $workhorseTurn.Args[1] -eq "never") "workhorse approval mode should be top-level before exec"
-        Assert-True ([Array]::IndexOf($workhorseTurn.Args, "--search") -lt $workhorseExec) "search should be a top-level option before exec"
-        Assert-True ([Array]::IndexOf($workhorseTurn.Args, "--add-dir") -lt $workhorseExec) "add-dir should be a top-level option before exec"
+        $searchIndex = [Array]::IndexOf($workhorseTurn.Args, "--search")
+        $addDirIndex = [Array]::IndexOf($workhorseTurn.Args, "--add-dir")
+        Assert-True ($searchIndex -ge 0 -and $searchIndex -lt $workhorseExec) "search should be present as a top-level option before exec"
+        Assert-True ($addDirIndex -ge 0 -and $addDirIndex -lt $workhorseExec) "add-dir should be present as a top-level option before exec"
         Assert-True ($workhorseSandbox -gt $workhorseExec -and $workhorseTurn.Args[$workhorseSandbox + 1] -eq "workspace-write") "workhorse turns should use workspace-write"
         $resumeIndex = [Array]::IndexOf($workhorseTurn.Args, "resume")
         Assert-True ($resumeIndex -gt [Array]::IndexOf($workhorseTurn.Args, "-o")) "all exec options should remain before the resume subcommand"
         Assert-True ($workhorseTurn.Args[$resumeIndex + 1] -eq "fake-thread") "follow-up turns should resume the saved Codex thread"
         Assert-True (($workhorseTurn.Args -join "`n") -match "(?m)^features\.multi_agent=false$") "workhorse turns should disable multi-agent"
         Assert-True (($workhorseTurn.Args -join "`n") -match "(?m)^features\.web_search=true$") "safe config overrides should be passed as literal argument values"
+        Assert-True (($workhorseTurn.Args -join "`n") -match "(?m)^model_reasoning_effort=xhigh$") "advertised xhigh pair defaults should reach listener invocation"
         Assert-True ($workhorseTurn.Stdin -match "MODE: workhorse") "workhorse envelope should identify workhorse mode"
         Assert-True ($workhorseTurn.Stdin -match "implement") "workhorse envelope should require implementation"
         Assert-True ($workhorseTurn.Stdin -match "run verification") "workhorse envelope should require verification"
@@ -273,9 +317,25 @@ function Test-WorkerModes {
 
         $meshOverride = Invoke-ScriptExpectFailure -ScriptName "new-pair.ps1" -ScriptArgs @("-NoSpawn", "-Task", "mesh", "-Mode", "workhorse", "-ConfigOverride", "features.multi_agent=true", "-CodexBin", $fakeCodex)
         Assert-True ($meshOverride.ExitCode -ne 0) "generic overrides should not bypass the multi-agent guard"
+
+        $tamperedJson = & (Join-Path $Scripts "new-pair.ps1") -NoSpawn -Task "tampered review" -WorkerName "tampered" -Mode review -CodexBin $fakeCodex -CodexModel auto -CodexReasoning auto | Select-Object -Last 1
+        $tampered = $tamperedJson | ConvertFrom-Json
+        $tamperedMetaPath = Join-Path $tampered.pair_dir "pair.json"
+        $tamperedMeta = Get-Content -LiteralPath $tamperedMetaPath -Raw | ConvertFrom-Json
+        Assert-True ($tamperedMeta.requested_model -eq "auto") "pair metadata should preserve an automatic model request"
+        Assert-True ($tamperedMeta.codex_model -eq "gpt-test-frontier") "pair metadata should persist the resolved automatic model"
+        Assert-True ($tamperedMeta.requested_reasoning -eq "auto") "pair metadata should preserve an automatic reasoning request"
+        Assert-True ($tamperedMeta.codex_reasoning -eq "medium") "pair metadata should persist the resolved automatic reasoning"
+        $tamperedMeta.sandbox = "workspace-write"
+        $tamperedMetaJson = $tamperedMeta | ConvertTo-Json -Depth 10
+        [System.IO.File]::WriteAllText($tamperedMetaPath, $tamperedMetaJson, [System.Text.UTF8Encoding]::new($false))
+        Assert-TamperedPairRejected -Pair $tampered -FakeCodex $fakeCodex -CaptureDir (Join-Path $tempRoot "tampered-capture")
+        & (Join-Path $Scripts "purge-pair.ps1") -PairId $tampered.pair_id -Force | Out-Null
+        $tampered = $null
     } finally {
-        if ($null -ne $review) { & (Join-Path $Scripts "purge-pair.ps1") -PairId $review.pair_id -Force | Out-Null }
-        if ($null -ne $workhorse) { & (Join-Path $Scripts "purge-pair.ps1") -PairId $workhorse.pair_id -Force | Out-Null }
+        if ($null -ne $review -and (Test-Path -LiteralPath $review.pair_dir)) { & (Join-Path $Scripts "purge-pair.ps1") -PairId $review.pair_id -Force | Out-Null }
+        if ($null -ne $workhorse -and (Test-Path -LiteralPath $workhorse.pair_dir)) { & (Join-Path $Scripts "purge-pair.ps1") -PairId $workhorse.pair_id -Force | Out-Null }
+        if ($null -ne $tampered -and (Test-Path -LiteralPath $tampered.pair_dir)) { & (Join-Path $Scripts "purge-pair.ps1") -PairId $tampered.pair_id -Force | Out-Null }
         $env:CODEX_HOME = $oldCodexHome
         Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
