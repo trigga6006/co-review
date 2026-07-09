@@ -1,173 +1,221 @@
 ---
 name: co-review
-description: Pair the current Claude Code session with a sibling OpenAI Codex CLI session so the two agents can ping-pong without copy-paste. Spawns a background PowerShell window (minimized) running a Codex listener, wires up file-based message passing under ~/.cc-codex-pairs/<pair-id>/, and gives Claude send/recv/ask primitives. Each Claude session that runs the skill creates its OWN sibling - multiple pairs run side-by-side. Use this skill whenever the user invokes "/co-review", says "pair with codex" or "spawn a codex sibling", OR is in a multi-turn task where they would benefit from sustained back-and-forth with Codex as reviewer - even if they don't explicitly name the skill. Specific triggers: a non-trivial refactor or implementation that wants a second opinion before shipping, debating two design approaches, working through a hard bug where outside perspective helps, or any situation where the user mentions wanting Codex to review or critique their work.
+description: Use when Claude should ask Codex for a review or second opinion, delegate implementation to Codex as a workhorse or sub-agent, run multiple Codex workers, or honor a requested Codex model, reasoning level, sandbox, or execution mode.
 ---
 
-# co-review - Claude Code <-> Codex pair workflow
+# Codex workers for Claude Code
 
-You are now in a paired-session workflow. The user wants this Claude Code session to have a dedicated OpenAI Codex CLI sibling running in a separate terminal window. The two of you exchange messages via a file-based message queue.
+Claude is the sole orchestrator. Codex processes are leaf workers: Claude chooses their assignments and configuration, reviews their results, and communicates with the user. A Codex worker must not spawn, delegate to, or coordinate other agents.
 
-## When to use
+Workers run through a hidden PowerShell listener that maintains a persistent Codex thread and file queue. The listener is a background process host, not the interactive Codex TUI.
 
-**Explicit triggers** (always invoke):
-- User types `/co-review` or says "pair with codex", "spawn a codex sibling", "have codex review this"
-- User asks to "ask codex" mid-task and the conversation looks like it will involve more than one exchange
+## Decision table
 
-**Implicit triggers** (invoke proactively, even without exact phrasing):
-- User finishes a non-trivial implementation, refactor, or bug fix and you sense they want a second opinion before shipping
-- User is debating between two approaches and wants outside judgment
-- User keeps copy-pasting between Claude Code and Codex manually - that is exactly the pain this skill removes
-- User is working through a hard problem over many turns and would benefit from a sustained reviewer rather than restarting context with Codex each time
+| User intent | Mode | Sandbox | Isolation |
+|---|---|---|---|
+| Review, critique, challenge, second opinion | `review` | `read-only` | `shared` |
+| Implement, fix, test, workhorse, sub-agent | `workhorse` | `workspace-write` | `auto` |
+| Several reviews in parallel | one `review` worker per concern | `read-only` | `shared` |
+| Several writers in parallel | one `workhorse` per task | `workspace-write` | managed Git worktrees |
 
-When in doubt, ask: "Want me to spin up a Codex sibling so we can ping-pong on this?" Better to offer than to silently leave them copy-pasting.
+Explicit user choices for mode, model, reasoning, isolation, search, or visibility take precedence. Never silently widen permissions.
 
-**When NOT to use:**
-- Single one-shot Codex review (use the existing `codex` skill - `/codex review`, `/codex challenge`, `/codex consult` - it is faster for that)
-- The user wants Claude alone, not a paired review workflow
-- Simple lookups or questions that don't need a second agent
+## Non-negotiable guardrails
 
-`co-review` is specifically for sustained ping-pong over many turns. The setup cost (spawning a listener window) only pays off if the user will ask Codex more than once.
+- Keep Claude as the sole orchestrator; each Codex process is a leaf worker.
+- Review workers are always read-only.
+- A shared-checkout workhorse holds a writer lease. Claude must not edit that checkout until the worker finishes.
+- Parallel workhorses use separate Git worktrees. The system never auto-merges their work.
+- Automatic parallel isolation refuses a dirty source repository because uncommitted changes are absent from a new worktree. Serialize instead, or use `-AllowDirtyBase` only when the user accepts committed-HEAD-only context.
+- Use `danger-full-access` only when the user explicitly requests it, and pass `-ConfirmDangerFullAccess`.
+- Do not ask workers to spawn agents. The listener also forces Codex `features.multi_agent=false`.
+- Claude reviews worker changes and verification evidence before claiming completion.
 
-## Architecture (read this once, then act)
+## Script root
 
-- **Pair dir**: `~/.cc-codex-pairs/<pair-id>/` (Windows: `C:\Users\<user>\.cc-codex-pairs\<pair-id>\`)
-  - `to-codex.jsonl` - messages Claude sends (one JSON per line)
-  - `to-claude.jsonl` - messages Codex sends back
-  - `state.json` - `{ "last_processed": "<msg-id>", "codex_session_id": "<thread-id-or-null>" }`
-  - `pair.json` - `{ "pair_id", "created_at", "project_cwd", "task_hint" }`
-  - `listener.pid` - PID of the spawned listener (written at startup, removed on exit)
-  - `listener.log` - human-readable listener activity
-  - `disagreements.log` - one line per stylistic disagreement Claude demoted out of the main thread (see Disagreement protocol below). Only created when first written to.
-  - JSONL message files retain full prompts and replies until archived or deleted
-  - `shutdown` - touch file; listener exits cleanly when it sees this
-- **Codex window**: a new PowerShell console window (spawned minimized by default) running `codex-listener.ps1`. It polls `to-codex.jsonl`, runs `codex exec` (or `codex exec resume <thread-id>` for follow-ups), and appends responses to `to-claude.jsonl`. The window's cwd is the *project* cwd (so Codex picks up the project's `AGENTS.md`), not the pair dir.
-- **Pair ID** is the only thing you must remember inside this conversation. Pass it to every script call. Lose it and you can't reach the sibling (recover via `list-pairs.ps1`).
-
-## Primitives - invoke via the PowerShell tool using the call operator
-
-Use the PowerShell tool (not Bash) and call scripts with the `&` operator. **Never pass `-ExecutionPolicy Bypass`** - Claude Code's permission classifier auto-denies it. The user's CurrentUser policy (typically RemoteSigned) is sufficient for local skill scripts.
-
-All script paths are under `~/.claude/skills/co-review/scripts/` (or the equivalent junction target).
-
-### 1. Create a pair (start the sibling)
+Use PowerShell and the call operator. Never add `-ExecutionPolicy Bypass`.
 
 ```powershell
-& "$env:USERPROFILE\.claude\skills\co-review\scripts\new-pair.ps1" -Task "Review my refactor of the auth middleware"
+$coReview = "$env:USERPROFILE\.claude\skills\co-review\scripts"
 ```
 
-Output (last line is JSON):
+If the skill is installed elsewhere, resolve the current skill directory and use its `scripts` child.
 
-```
-{"pair_id":"pair-20260516-153012-a3f1","pair_dir":"...","window_spawned":true}
-```
+## Orchestration workflow
 
-A new PowerShell window spawns **minimized** by default - visible in the taskbar but never stealing focus or overlaying the user's other windows. Tell the user the pair ID so they can spot the right taskbar icon if they want to peek.
+### 1. Honor the user's configuration
 
-Optional flags:
-- `-CodexModel "gpt-5.5"` - which Codex model to use. Defaults to `gpt-5.5`. Override only if the user explicitly asks for a different model (e.g., "use gpt-5 instead").
-- `-CodexReasoning medium` - reasoning effort: `low` / `medium` / `high`. Defaults to `medium`. Bump to `high` for security audits or hard architectural reviews where Codex should think longer; drop to `low` for quick sanity checks.
-- `-WindowMode Hidden` - listener has no visible window at all (activity still visible via `~/.cc-codex-pairs/<pair-id>/listener.log` and `list-pairs.ps1`).
-- `-WindowMode Foreground` - old behavior, opens the window in the foreground. Avoid unless the user explicitly asks.
-- `-CodexTimeoutSec 1800` - max seconds to let one Codex turn run before the listener kills it and returns an error.
+Extract any explicit request for:
 
-The defaults (`gpt-5.5`, `medium`) are pinned in the skill so behavior is consistent across machines regardless of each user's `~/.codex/config.toml`. The `-m` and reasoning flags are passed explicitly to every `codex exec` call.
+- mode: review or workhorse
+- model slug
+- reasoning level
+- parallel or serial execution
+- search, profile, additional writable directories, or advanced config
+- hidden, minimized, or foreground listener
 
-Capture `pair_id` from the JSON line - you will need it for every other call.
+An explicit choice wins over heuristics.
 
-### 2. Send a message and wait for the reply (most common)
+### 2. Discover live options
+
+Run this when capabilities are not already fresh in the current conversation:
 
 ```powershell
-& "$env:USERPROFILE\.claude\skills\co-review\scripts\ask.ps1" -PairId "pair-20260516-153012-a3f1" -Message "Here is my diff. Review for correctness and edge cases:`n`n<diff>" -TimeoutSec 600
+$caps = & "$coReview\get-capabilities.ps1" -Json | ConvertFrom-Json
+$caps.models | Select-Object slug, display_name, default_reasoning_level, supported_reasoning_levels, additional_speed_tiers
 ```
 
-Blocks until Codex replies (or timeout). Default timeout 600s. Matching is done by `in_reply_to == msgId`, so it is race-free.
+Do not rely on a frozen model list. Choose only combinations advertised by the installed Codex cache. Hidden/internal models appear only with `-IncludeHidden`.
 
-For long prompts (large diffs), use `-MessageFile <path>` instead of `-Message` to avoid command-line length limits.
+Selection guidance when the user did not choose:
 
-Optional per-ask flag:
-- `-Reasoning low|medium|high` - override the pair-level reasoning effort for just this one ask. Empty / omitted = use pair default (typically `medium`). Bump to `high` for security audits, hard correctness questions, or architectural decisions. Drop to `low` only for cheap sanity checks. Default `medium` is the right answer for most reviews - don't pre-emptively go high without a reason.
+- Hard architecture, security, correctness, debugging, or ambiguous review: highest-capability visible model and higher reasoning.
+- Ordinary implementation/review: highest-priority visible model and its advertised default reasoning.
+- Small, mechanical, low-risk task: a visible smaller/faster model.
+- If live models are unavailable, use `configured-default` or an explicit known model. Unknown slugs require `-AllowUnknownModel` on `new-worker.ps1`.
 
-### 3. Send without blocking
+### 3. Reuse or create a matching worker
+
+List current workers:
 
 ```powershell
-& "$env:USERPROFILE\.claude\skills\co-review\scripts\send.ps1" -PairId "pair-20260516-153012-a3f1" -Message "<text>"
+$workers = @(& "$coReview\list-workers.ps1" -Json | ConvertFrom-Json)
 ```
 
-Returns the new message ID.
+Reuse an idle worker only when its project, mode, sandbox, and responsibility match. A persistent worker retains its Codex thread. Start a new named worker when the role or capability boundary differs.
 
-### 4. Poll / wait for new replies
+### 4. Dispatch and wait or continue in parallel
+
+Use `ask-worker.ps1` for the common synchronous path. Use `send-worker.ps1` plus `recv-worker.ps1` when Claude has useful independent work or several workers are running.
+
+### 5. Review and integrate
+
+For workhorses, inspect the diff and reported test evidence. For managed worktrees, review the dedicated branch/commit and deliberately cherry-pick or merge it. Never auto-integrate.
+
+### 6. Stop workers
+
+Stop workers when the task finishes or the conversation pivots. Preserve isolated worktrees unless their changes are safely integrated or the user confirms removal.
+
+## Complete examples
+
+### Review with the strongest available model
 
 ```powershell
-& "$env:USERPROFILE\.claude\skills\co-review\scripts\recv.ps1" -PairId "pair-20260516-153012-a3f1" -Since "cdx-0003" -Wait -TimeoutSec 300
+$caps = & "$coReview\get-capabilities.ps1" -Json | ConvertFrom-Json
+$model = $caps.models[0].slug
+$reasoning = if (@($caps.models[0].supported_reasoning_levels.effort) -contains "high") { "high" } else { $caps.models[0].default_reasoning_level }
+
+$reviewer = & "$coReview\new-worker.ps1" `
+  -Name "auth-review" `
+  -Mode review `
+  -Task "Review the current authentication changes for correctness and security" `
+  -ProjectCwd (Get-Location).Path `
+  -Model $model `
+  -Reasoning $reasoning | Select-Object -Last 1 | ConvertFrom-Json
+
+& "$coReview\ask-worker.ps1" `
+  -WorkerId $reviewer.worker_id `
+  -Message "Inspect the current diff. Return a verdict and prioritized evidence-backed findings with file references." `
+  -TimeoutSec 900
 ```
 
-`-Since` is the last reply ID you have already seen (omit on first call to get all). `-Wait` polls until something new arrives.
-
-### 5. End the pair (close the Codex window cleanly)
+### Workhorse sub-agent
 
 ```powershell
-& "$env:USERPROFILE\.claude\skills\co-review\scripts\end-pair.ps1" -PairId "pair-20260516-153012-a3f1"
+$worker = & "$coReview\new-worker.ps1" `
+  -Name "parser-implementation" `
+  -Mode workhorse `
+  -Task "Implement the parser change and run its focused tests" `
+  -ProjectCwd (Get-Location).Path `
+  -Model $model `
+  -Reasoning medium `
+  -Isolation auto | Select-Object -Last 1 | ConvertFrom-Json
+
+& "$coReview\ask-worker.ps1" `
+  -WorkerId $worker.worker_id `
+  -Message "Implement the bounded parser task from the repository context. Run appropriate tests and report outcome, changed files, commands/results, and remaining risks." `
+  -TimeoutSec 1800
 ```
 
-Use `-Archive` to move the retained pair logs under `~/.cc-codex-pairs/archive/`. Use `-Delete` to remove the retained prompts/replies after shutdown.
+While this shared workhorse owns the checkout, Claude pauses its own edits. After the reply, Claude inspects and verifies the changes.
 
-### 6. List active pairs (recovery)
+### Parallel workhorses
+
+Start the first worker normally. Additional `-Isolation auto` workhorses for the same clean Git repository receive separate managed worktrees:
 
 ```powershell
-& "$env:USERPROFILE\.claude\skills\co-review\scripts\list-pairs.ps1"
+$api = & "$coReview\new-worker.ps1" -Name "api-task" -Mode workhorse -Task "Implement API task" -ProjectCwd $repo -Model $model -Reasoning medium -Isolation auto | Select-Object -Last 1 | ConvertFrom-Json
+$ui  = & "$coReview\new-worker.ps1" -Name "ui-task"  -Mode workhorse -Task "Implement UI task"  -ProjectCwd $repo -Model $model -Reasoning medium -Isolation auto | Select-Object -Last 1 | ConvertFrom-Json
+
+& "$coReview\send-worker.ps1" -WorkerId $api.worker_id -Message "Implement and verify only the API task."
+& "$coReview\send-worker.ps1" -WorkerId $ui.worker_id  -Message "Implement and verify only the UI task."
+
+& "$coReview\recv-worker.ps1" -WorkerId $api.worker_id -Wait -TimeoutSec 1800
+& "$coReview\recv-worker.ps1" -WorkerId $ui.worker_id  -Wait -TimeoutSec 1800
 ```
 
-Status is determined by `listener.pid` liveness, not just the shutdown file.
+Each isolated workhorse commits to its dedicated branch. Claude reviews and integrates each branch separately.
 
-### 7. Purge retained logs
+## Configuration options
+
+`new-worker.ps1` supports:
+
+- `-Name`, `-Task`, `-Mode`, `-ProjectCwd`
+- `-Model`, `-Reasoning`, `-AllowUnknownModel`
+- `-Isolation auto|shared|worktree`, `-AllowDirtyBase`
+- `-Sandbox`, `-ConfirmDangerFullAccess`
+- `-WindowMode Hidden|Minimized|Foreground` (default `Hidden`)
+- `-TimeoutSec`
+- `-Profile`
+- `-AddDir <path[]>`
+- `-Search`
+- `-ConfigOverride <key=value[]>`
+
+Generic config overrides cannot replace guarded model, reasoning, sandbox, approval, working-directory, output, thread, or multi-agent settings.
+
+Per-turn `ask-worker.ps1` and `send-worker.ps1` may override `-Model`, `-Reasoning`, and `-TurnTimeoutSec`. They cannot change mode or sandbox.
+
+## Command reference
+
+| Command | Purpose |
+|---|---|
+| `get-capabilities.ps1` | Show installed models, reasoning levels, and supported worker options |
+| `new-worker.ps1` | Start a named review/workhorse worker |
+| `ask-worker.ps1` | Send one task and wait for its correlated reply |
+| `send-worker.ps1` | Queue a task without blocking |
+| `recv-worker.ps1` | Poll or wait for replies |
+| `list-workers.ps1` | Show names, modes, models, directories, threads, leases, and status |
+| `ensure-worker.ps1` | Verify/restart a remembered listener without losing its queue/thread |
+| `end-worker.ps1` | Stop and optionally archive/delete a worker |
+| `purge-worker.ps1` | Permanently delete stopped worker logs/state |
+
+The old pair-oriented commands remain compatibility aliases for existing users. Legacy pairs are interpreted as shared, read-only review workers.
+
+## Recovery
+
+Remember each `worker_id`. If a session resumes after sleep/reboot:
 
 ```powershell
-& "$env:USERPROFILE\.claude\skills\co-review\scripts\purge-pair.ps1" -PairId "pair-20260516-153012-a3f1" -Force
+& "$coReview\ensure-worker.ps1" -WorkerId $workerId -Json
 ```
 
-Deletes a stopped pair directory permanently. This removes `to-codex.jsonl`, `to-claude.jsonl`, `state.json`, and logs.
+`ask-worker.ps1` and `send-worker.ps1` also ensure the listener before queueing. Restart preserves message history and the Codex thread ID in `state.json`.
 
-## Operating instructions for you (Claude)
+## Result handling and disagreement
 
-1. **Spawn at most one pair per Claude conversation.** Before calling `new-pair.ps1`, check:
-   - Do you already have a `pair_id` tracked from earlier in this conversation? If yes, reuse it. Do NOT spawn another.
-   - If you are unsure (e.g. long conversation, you can't find the pair_id in context), run `list-pairs.ps1` first. If there is an `active` pair whose `project_cwd` matches the user's current working directory and whose `task_hint` matches what you are doing, reuse that `pair_id` instead of spawning a new one.
-   - Only call `new-pair.ps1` if no existing pair fits, or the user explicitly asks for a fresh sibling.
+Claude evaluates every reply rather than blindly relaying it.
 
-2. **When you do spawn**: call `new-pair.ps1` with a short `-Task` describing what you are working on. Parse the JSON output for `pair_id`. Tell the user: "Spawned Codex sibling <pair-id>." Then continue the user's task.
+- Correctness/security disagreement between Claude and Codex: show both verdicts to the user, labeled `Claude:` and `Codex:`, with a short weighting note. The user resolves it.
+- Stylistic/taste disagreement: keep it out of the main thread; optionally append one summary line to the worker's `disagreements.log`.
+- Workhorse result: verify changed files and tests before claiming success.
 
-3. **Reuse the pair_id for every ask.** The Codex listener captures Codex's `thread_id` on its first run and uses `codex exec resume <thread-id>` for every subsequent message, so Codex sees the full conversation history on its side automatically. You do NOT need to re-spawn or re-create the pair to get continuity. If you want to verify continuity is working, look at `state.json` `codex_session_id` after the first ask - it should be populated with a thread id. If it stays null, fall back to including prior context inline in your messages.
+Cross-family disagreement is useful signal. Do not silently erase behavioral or security divergence.
 
-4. **When to call Codex**:
-   - After a non-trivial implementation, ask for review
-   - When you are unsure between two approaches, ask for opinion
-   - Before claiming a task done, ask Codex to spot what you missed
-   - The user may also explicitly say "ask codex"
+## Windows and privacy notes
 
-   **Reasoning level per ask:** the pair has a default reasoning effort (typically `medium`). You can override per-ask with `ask.ps1 -Reasoning <low|medium|high>`. Heuristic:
-   - `high` only when the question genuinely needs deeper thinking - security audits, hard correctness questions, architectural decisions, race/concurrency analysis. Don't reflexively reach for high - medium is the right answer for most reviews.
-   - `low` for cheap sanity checks ("does this look reasonable?", "any obvious issues?")
-   - `medium` (no override) for everything else - the default is well-tuned
-
-   **Token budget:** the user's Codex usage limits are deliberately generous - don't try to be efficient on Codex's behalf. NEVER instruct Codex to "be brief", "keep it short", "concisely", etc. If Codex wants to be thorough, that is the feature, not the bug. The whole point of paying setup cost for a Codex sibling is depth - throwing that away to save tokens defeats the workflow.
-
-5. **Surfacing Codex's response to the user / disagreement protocol.** Relay Codex's reply, but classify any disagreement before deciding what to surface:
-
-   - **Correctness or security divergences** (Codex found a bug Claude missed, Claude disagrees that something is actually a bug, the two models reach different conclusions about whether code behaves correctly, has a vulnerability, races, leaks, breaks an invariant, or violates a contract): surface BOTH verdicts to the user explicitly, side by side. Label them `Codex:` and `Claude:`. Then add a one-line note on how to weight them. The user resolves, not you.
-   - **Stylistic or taste divergences** (naming, formatting, equivalent idiom choice, mild architectural preferences, mild verbosity, "I would have written it this way"): demote to `~/.cc-codex-pairs/<pair-id>/disagreements.log` as one line: `[ISO timestamp] [style] [one-line summary of the divergence]`. Append via `Add-Content` from the PowerShell tool. Do NOT interrupt the user with these. They can review the log later if curious.
-
-   Why this matters: the most informationally valuable property of pairing two different model families is that they fail differently. Same-family review (Opus+Opus, GPT+GPT) shares blindspots; cross-family disagreement is where the bugs neither model alone would catch fall out. If you silently arbitrate that disagreement, you delete the exact signal the user is paying setup cost to get. Style noise is the cost; behavioral/security disagreement is the payoff. Keep one, demote the other.
-
-6. **End the pair when**: user says they are done, the task is shipped, or the conversation pivots to something unrelated. Call `end-pair.ps1` to close the terminal cleanly.
-
-## Caveats / known limitations
-
-- The listener requires Windows PowerShell 5.1+ on Windows (no .NET Core dependencies).
-- If installing from a downloaded zip or browser download, Windows may mark scripts as remote. If local execution policy blocks them, run: `Get-ChildItem "$env:USERPROFILE\.claude\skills\co-review" -Recurse | Unblock-File`
-- Pair logs are local but persistent. Do not send secrets to Codex unless you are comfortable with them being stored in `~/.cc-codex-pairs/<pair-id>/` until archived or deleted.
-- No real-time interrupts. If you send a message while Codex is mid-response, it will be processed after the current one finishes.
-- The Codex window is a real terminal - the user can also type into it manually if they want to talk to Codex directly. Treat that as normal; the listener still processes your messages.
-- One pair per Claude session. If the user explicitly wants two pairs in one Claude session, you can call `new-pair.ps1` twice and track two pair IDs - but that is unusual.
-- Codex runs with `--sandbox read-only` by default, so it cannot edit files. If the user wants Codex to apply suggestions directly, they will need to relax the sandbox via `codex exec --sandbox workspace-write` - but that is currently hardcoded in the listener.
-- `-CodexBin` is intended only for advanced local debugging and must point to an executable named `codex.exe` or `codex`.
-- The default Codex model is `gpt-5.5` at `medium` reasoning. As OpenAI ships new Codex models, the default in `scripts/new-pair.ps1` and `scripts/codex-listener.ps1` should be bumped manually - the skill doesn't auto-detect.
+- Requires Windows PowerShell 5.1+ and the Codex CLI.
+- Background is `Hidden` by default. `Minimized` or `Foreground` shows the listener log console; it is still not the interactive Codex TUI.
+- Prompts and replies persist under `~/.cc-codex-pairs/<pair-id>/` until archived or deleted.
+- Managed worktrees live under `~/.cc-codex-worktrees/` and are retained by default.
+- Do not send secrets unless the user accepts local persistence and Codex processing.
+- If downloaded scripts are blocked, run `Get-ChildItem "$env:USERPROFILE\.claude\skills\co-review" -Recurse | Unblock-File` once.

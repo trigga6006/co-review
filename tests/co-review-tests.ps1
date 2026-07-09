@@ -605,6 +605,21 @@ function Test-WorktreeIsolation {
     }
 }
 
+function Test-SkillCommandContracts {
+    $skill = Get-Content -LiteralPath (Join-Path $RepoRoot "SKILL.md") -Raw
+    foreach ($required in @(
+        "get-capabilities.ps1", "new-worker.ps1", "ask-worker.ps1", "send-worker.ps1", "recv-worker.ps1",
+        "list-workers.ps1", "ensure-worker.ps1", "end-worker.ps1", "review", "workhorse", "writer lease",
+        "worktree", "Hidden", "danger-full-access", "ConfirmDangerFullAccess", "leaf worker"
+    )) {
+        Assert-True ($skill -match [regex]::Escape($required)) "SKILL.md should document $required"
+    }
+    Assert-True ($skill -match "explicit.*user|user.*explicit") "explicit user model/reasoning choices should take precedence"
+    Assert-True ($skill -match "Claude.*sole orchestrator") "SKILL.md should keep Claude as sole orchestrator"
+    Assert-True ($skill -notmatch "Spawn at most one pair per Claude conversation") "obsolete one-pair restriction should be removed"
+    Assert-True ($skill -notmatch "Codex runs with `--sandbox read-only` by default") "obsolete review-only limitation should be removed"
+}
+
 $TestGroups = [ordered]@{
     PathSafety = {
         Test-InvalidPairIdsRejected
@@ -617,6 +632,7 @@ $TestGroups = [ordered]@{
     WorkerLifecycle = { Test-WorkerLifecycle }
     WriterLeases = { Test-WriterLeases }
     WorktreeIsolation = { Test-WorktreeIsolation }
+    SkillCommandContracts = { Test-SkillCommandContracts }
 }
 
 if ($Only) {
