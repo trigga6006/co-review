@@ -6,15 +6,32 @@ param(
     [Parameter(Mandatory=$true)][string]$Message,
     [string]$Type = "request",
     [string]$MessageFile = "",
-    # Optional per-ask reasoning override. Empty string means "use pair default".
-    [ValidateSet("", "low", "medium", "high")]
-    [string]$Reasoning = ""
+    [string]$Model = "",
+    # Optional per-turn overrides. Empty strings mean "use pair default".
+    [string]$Reasoning = "",
+    [int]$TurnTimeoutSec = 0
 )
 
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "common.ps1")
 
 $pairDir = Get-PairDir -PairId $PairId -MustExist
+
+if ($TurnTimeoutSec -lt 0) {
+    throw "TurnTimeoutSec must be greater than zero when specified"
+}
+
+$resolvedModel = $Model
+$resolvedReasoning = $Reasoning
+if (-not [string]::IsNullOrWhiteSpace($Model) -or -not [string]::IsNullOrWhiteSpace($Reasoning)) {
+    $meta = Get-Content -LiteralPath (Join-Path $pairDir "pair.json") -Raw | ConvertFrom-Json
+    $modelToValidate = if ([string]::IsNullOrWhiteSpace($Model)) { [string]$meta.codex_model } else { $Model }
+    $reasoningToValidate = if ([string]::IsNullOrWhiteSpace($Reasoning)) { [string]$meta.codex_reasoning } else { $Reasoning }
+    $capabilities = Get-CodexCapabilities -CodexBin ([string]$meta.codex_bin)
+    $selection = Resolve-CodexSelection -Capabilities $capabilities -Model $modelToValidate -Reasoning $reasoningToValidate
+    if (-not [string]::IsNullOrWhiteSpace($Model)) { $resolvedModel = [string]$selection.model }
+    if (-not [string]::IsNullOrWhiteSpace($Reasoning)) { $resolvedReasoning = [string]$selection.reasoning }
+}
 
 $toCodex = Join-Path -Path $pairDir -ChildPath "to-codex.jsonl"
 
@@ -52,9 +69,9 @@ try {
         type = $Type
         content = $Message
     }
-    if (-not [string]::IsNullOrWhiteSpace($Reasoning)) {
-        $msgObj.reasoning = $Reasoning
-    }
+    if (-not [string]::IsNullOrWhiteSpace($resolvedModel)) { $msgObj.model = $resolvedModel }
+    if (-not [string]::IsNullOrWhiteSpace($resolvedReasoning)) { $msgObj.reasoning = $resolvedReasoning }
+    if ($TurnTimeoutSec -gt 0) { $msgObj.turn_timeout_sec = $TurnTimeoutSec }
     $msg = $msgObj | ConvertTo-Json -Compress -Depth 10
 
     Add-Content -Path $toCodex -Value $msg -Encoding UTF8

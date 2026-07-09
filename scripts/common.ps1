@@ -251,3 +251,51 @@ function Assert-SafeCodexConfigOverrides {
         if ($reserved -contains $key) { throw "Codex config '$key' has a dedicated guarded option" }
     }
 }
+
+function New-CodexTaskEnvelope {
+    param(
+        [Parameter(Mandatory=$true)]$Meta,
+        [Parameter(Mandatory=$true)][string]$Task
+    )
+
+    $workerName = [string]$Meta.worker_name
+    if ([string]::IsNullOrWhiteSpace($workerName)) { $workerName = [string]$Meta.pair_id }
+    $mode = [string]$Meta.mode
+    if ([string]::IsNullOrWhiteSpace($mode)) { $mode = "review" }
+    $workingDirectory = [string]$Meta.project_cwd
+
+    if ($mode -eq "workhorse") {
+        $contract = @"
+Implement the bounded task in the working directory, run verification appropriate to the change, and report:
+- outcome
+- changed files
+- verification commands and results
+- remaining blockers or risks
+"@
+    } else {
+        $contract = @"
+Inspect the requested scope and return an evidence-backed review. You MUST NOT edit files.
+Report:
+- verdict
+- prioritized findings with file references
+- uncertainty
+- recommended next actions
+"@
+    }
+
+    return @"
+CODEX LEAF WORKER
+WORKER: $workerName
+MODE: $mode
+WORKING DIRECTORY: $workingDirectory
+
+You are a leaf worker controlled by Claude. Do not spawn, delegate to, or coordinate other agents.
+Do not broaden the task or permissions. Report blockers instead.
+
+COMPLETION CONTRACT:
+$($contract.Trim())
+
+TASK FROM CLAUDE:
+$Task
+"@
+}

@@ -8,9 +8,10 @@ param(
     [string]$Type = "request",
     [int]$TimeoutSec = 600,
     [int]$PollIntervalSec = 2,
-    # Optional per-ask reasoning override. Empty string means "use pair default".
-    [ValidateSet("", "low", "medium", "high")]
+    [string]$Model = "",
+    # Optional per-turn overrides. TurnTimeoutSec is separate from the wait timeout above.
     [string]$Reasoning = "",
+    [int]$TurnTimeoutSec = 0,
     [switch]$RawJson
 )
 
@@ -22,9 +23,9 @@ Assert-ValidPairId -PairId $PairId
 
 # Invoke send.ps1 in-process via the call operator (no subshell, no exec-policy flag).
 if ($PSCmdlet.ParameterSetName -eq "File") {
-    $msgId = (& $sendPath -PairId $PairId -Type $Type -MessageFile $MessageFile -Reasoning $Reasoning | Select-Object -Last 1).ToString().Trim()
+    $msgId = (& $sendPath -PairId $PairId -Type $Type -MessageFile $MessageFile -Model $Model -Reasoning $Reasoning -TurnTimeoutSec $TurnTimeoutSec | Select-Object -Last 1).ToString().Trim()
 } else {
-    $msgId = (& $sendPath -PairId $PairId -Type $Type -Message $Message -Reasoning $Reasoning | Select-Object -Last 1).ToString().Trim()
+    $msgId = (& $sendPath -PairId $PairId -Type $Type -Message $Message -Model $Model -Reasoning $Reasoning -TurnTimeoutSec $TurnTimeoutSec | Select-Object -Last 1).ToString().Trim()
 }
 if ([string]::IsNullOrWhiteSpace($msgId)) {
     Write-Error "send.ps1 did not return a message id"

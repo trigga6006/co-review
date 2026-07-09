@@ -14,6 +14,15 @@ param(
     [int]$CodexTimeoutSec = 1800,
     [ValidateSet("Minimized", "Hidden", "Foreground")]
     [string]$WindowMode = "Minimized",
+    [ValidateSet("review", "workhorse")][string]$Mode = "review",
+    [string]$WorkerName = "",
+    [ValidateSet("auto", "shared", "worktree")][string]$Isolation = "shared",
+    [ValidateSet("", "read-only", "workspace-write", "danger-full-access")][string]$Sandbox = "",
+    [switch]$ConfirmDangerFullAccess,
+    [string[]]$ConfigOverride = @(),
+    [string]$Profile = "",
+    [string[]]$AddDir = @(),
+    [switch]$Search,
     [switch]$NoSpawn,
     [switch]$DryRunListener  # pass -DryRun to the listener (echo only, no codex)
 )
@@ -57,10 +66,31 @@ if ([string]::IsNullOrWhiteSpace($CodexBin)) {
 }
 Assert-ValidCodexBin -CodexBin $CodexBin
 
+Assert-SafeCodexConfigOverrides -Overrides $ConfigOverride
+
+if ([string]::IsNullOrWhiteSpace($Sandbox)) {
+    $Sandbox = if ($Mode -eq "workhorse") { "workspace-write" } else { "read-only" }
+}
+if ($Mode -eq "review" -and $Sandbox -ne "read-only") {
+    throw "Review workers must use the read-only sandbox"
+}
+if ($Sandbox -eq "danger-full-access" -and -not $ConfirmDangerFullAccess) {
+    throw "danger-full-access requires -ConfirmDangerFullAccess"
+}
+
+$resolvedAddDirs = @()
+foreach ($dir in $AddDir) {
+    if ([string]::IsNullOrWhiteSpace($dir) -or -not (Test-Path -LiteralPath $dir -PathType Container)) {
+        throw "AddDir does not exist or is not a directory: $dir"
+    }
+    $resolvedAddDirs += (Resolve-Path -LiteralPath $dir).Path
+}
+
 # Generate pair id: pair-<yyyymmdd>-<4 hex>
 $timestamp = (Get-Date).ToString("yyyyMMdd-HHmmss")
 $randHex = -join ((1..4) | ForEach-Object { "{0:x}" -f (Get-Random -Maximum 16) })
 $pairId = "pair-$timestamp-$randHex"
+if ([string]::IsNullOrWhiteSpace($WorkerName)) { $WorkerName = $pairId }
 
 $root = Join-Path -Path $env:USERPROFILE -ChildPath ".cc-codex-pairs"
 $pairDir = Join-Path -Path $root -ChildPath $pairId
@@ -85,14 +115,28 @@ $state = @{
 [System.IO.File]::WriteAllText($stateFile, $state, [System.Text.UTF8Encoding]::new($false))
 
 $meta = @{
+    schema_version = 2
     pair_id = $pairId
+    worker_name = $WorkerName
     created_at = (Get-Date).ToString("o")
     project_cwd = $ProjectCwd
     task_hint = $Task
+    mode = $Mode
+    sandbox = $Sandbox
+    isolation = $Isolation
     codex_bin = $CodexBin
+    requested_model = $CodexModel
     codex_model = $CodexModel
+    requested_reasoning = $CodexReasoning
     codex_reasoning = $CodexReasoning
-} | ConvertTo-Json
+    config_overrides = @($ConfigOverride)
+    profile = $Profile
+    add_dirs = @($resolvedAddDirs)
+    search_enabled = [bool]$Search
+    codex_timeout_sec = $CodexTimeoutSec
+    window_mode = $WindowMode
+    dry_run_listener = [bool]$DryRunListener
+} | ConvertTo-Json -Depth 10
 [System.IO.File]::WriteAllText($pairMeta, $meta, [System.Text.UTF8Encoding]::new($false))
 
 # Path to listener script (sibling of this script)
@@ -171,5 +215,10 @@ $result = @{
     codex_bin = $CodexBin
     codex_model = $CodexModel
     codex_reasoning = $CodexReasoning
+    worker_name = $WorkerName
+    mode = $Mode
+    sandbox = $Sandbox
+    isolation = $Isolation
+    schema_version = 2
 } | ConvertTo-Json -Compress
 Write-Output $result

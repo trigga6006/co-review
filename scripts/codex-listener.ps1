@@ -6,11 +6,10 @@
 param(
     [Parameter(Mandatory=$true)][string]$PairId,
     [string]$CodexBin = "",
-    [string]$CodexModel = "gpt-5.5",
-    [ValidateSet("low", "medium", "high")]
-    [string]$CodexReasoning = "medium",
+    [string]$CodexModel = "",
+    [string]$CodexReasoning = "",
     [int]$PollIntervalSec = 2,
-    [int]$CodexTimeoutSec = 1800,
+    [int]$CodexTimeoutSec = 0,
     [switch]$DryRun  # echo messages without invoking codex
 )
 
@@ -43,8 +42,22 @@ trap {
 # Load metadata
 $meta = Get-Content $pairMeta -Raw | ConvertFrom-Json
 if ([string]::IsNullOrWhiteSpace($CodexBin)) { $CodexBin = $meta.codex_bin }
+if ([string]::IsNullOrWhiteSpace($CodexModel)) { $CodexModel = [string]$meta.codex_model }
+if ([string]::IsNullOrWhiteSpace($CodexReasoning)) { $CodexReasoning = [string]$meta.codex_reasoning }
+if ($CodexTimeoutSec -le 0) {
+    $CodexTimeoutSec = if ($meta.codex_timeout_sec -gt 0) { [int]$meta.codex_timeout_sec } else { 1800 }
+}
+$workerMode = [string]$meta.mode
+if ([string]::IsNullOrWhiteSpace($workerMode)) { $workerMode = "review" }
+$workerSandbox = [string]$meta.sandbox
+if ([string]::IsNullOrWhiteSpace($workerSandbox)) { $workerSandbox = "read-only" }
+$workerProfile = [string]$meta.profile
+$workerAddDirs = @($meta.add_dirs | ForEach-Object { [string]$_ })
+$workerSearch = ($meta.search_enabled -eq $true)
+$workerConfigOverrides = @($meta.config_overrides | ForEach-Object { [string]$_ })
 try {
     Assert-ValidCodexBin -CodexBin $CodexBin
+    Assert-SafeCodexConfigOverrides -Overrides $workerConfigOverrides
 } catch {
     Write-Host "[co-review] FATAL: $($_.Exception.Message)" -ForegroundColor Red
     Read-Host "Press Enter to close"
@@ -61,6 +74,7 @@ Write-Host "  Pair ID:     $PairId"
 Write-Host "  Pair dir:    $pairDir"
 Write-Host "  Project cwd: $($meta.project_cwd)"
 Write-Host "  Task:        $($meta.task_hint)"
+Write-Host "  Worker mode: $workerMode ($workerSandbox)"
 Write-Host "  Codex bin:   $CodexBin"
 Write-Host "  Codex model: $CodexModel ($CodexReasoning reasoning)"
 Write-Host "  Created:     $($meta.created_at)"
@@ -171,25 +185,50 @@ function Invoke-Codex {
         [string]$Prompt,
         [string]$SessionId,
         [string]$Cwd,
+        [string]$Model,
+        [string]$Sandbox,
         [int]$TimeoutSec,
-        [string]$Reasoning
+        [string]$Reasoning,
+        [string]$Profile,
+        [string[]]$AddDir = @(),
+        [bool]$Search = $false,
+        [string[]]$ConfigOverrides = @()
     )
 
     $lastMsgFile = New-TemporaryFile
 
     try {
+        Assert-SafeCodexConfigOverrides -Overrides $ConfigOverrides
+        $validatedAddDirs = @()
+        foreach ($dir in $AddDir) {
+            if ([string]::IsNullOrWhiteSpace($dir) -or -not (Test-Path -LiteralPath $dir -PathType Container)) {
+                throw "AddDir does not exist or is not a directory: $dir"
+            }
+            $validatedAddDirs += (Resolve-Path -LiteralPath $dir).Path
+        }
+
         # All global `exec` options must come BEFORE the `resume` subcommand;
         # clap rejects `--sandbox` etc. after the subcommand name.
         # `-m` pins the model so behavior is consistent across machines regardless
         # of each user's ~/.codex/config.toml. `-c model_reasoning_effort=...`
         # overrides reasoning depth the same way.
-        $codexArgs = @(
+        $codexArgs = @("-a", "never")
+        if ($Search) { $codexArgs += "--search" }
+        foreach ($dir in $validatedAddDirs) { $codexArgs += @("--add-dir", $dir) }
+        $codexArgs += @(
             "exec",
             "--json",
             "--skip-git-repo-check",
-            "--sandbox", "read-only",
-            "-m", $CodexModel,
+            "--sandbox", $Sandbox
+        )
+        if (-not [string]::IsNullOrWhiteSpace($Profile)) { $codexArgs += @("-p", $Profile) }
+        $codexArgs += @(
+            "-m", $Model,
             "-c", "model_reasoning_effort=$Reasoning",
+            "-c", "features.multi_agent=false"
+        )
+        foreach ($override in $ConfigOverrides) { $codexArgs += @("-c", $override) }
+        $codexArgs += @(
             "-C", $Cwd,
             "-o", $lastMsgFile.FullName
         )
@@ -366,14 +405,21 @@ while ($true) {
         } else {
             try {
                 $sid = $state.codex_session_id
-                # Per-ask reasoning override: if the incoming message has a `reasoning` field,
-                # use it for this turn only. Otherwise fall back to the pair-level default.
+                $effectiveModel = if ($msg.model) { [string]$msg.model } else { $CodexModel }
                 $effectiveReasoning = if ($msg.reasoning) { $msg.reasoning } else { $CodexReasoning }
+                $effectiveTimeout = if ($msg.turn_timeout_sec -gt 0) { [int]$msg.turn_timeout_sec } else { $CodexTimeoutSec }
+                if ($msg.model -or $msg.reasoning) {
+                    $capabilities = Get-CodexCapabilities -CodexBin $CodexBin
+                    $selection = Resolve-CodexSelection -Capabilities $capabilities -Model $effectiveModel -Reasoning $effectiveReasoning
+                    $effectiveModel = [string]$selection.model
+                    $effectiveReasoning = [string]$selection.reasoning
+                }
                 if ($effectiveReasoning -ne $CodexReasoning) {
                     Write-Host "    [co-review] Reasoning override for $($msg.id): $effectiveReasoning (pair default: $CodexReasoning)" -ForegroundColor DarkCyan
                     Write-Log "Reasoning override on $($msg.id): $effectiveReasoning"
                 }
-                $result = Invoke-Codex -Prompt $msg.content -SessionId $sid -Cwd $workDir -TimeoutSec $CodexTimeoutSec -Reasoning $effectiveReasoning
+                $envelope = New-CodexTaskEnvelope -Meta $meta -Task ([string]$msg.content)
+                $result = Invoke-Codex -Prompt $envelope -SessionId $sid -Cwd $workDir -Model $effectiveModel -Reasoning $effectiveReasoning -Sandbox $workerSandbox -TimeoutSec $effectiveTimeout -Profile $workerProfile -AddDir $workerAddDirs -Search $workerSearch -ConfigOverrides $workerConfigOverrides
 
                 if ($result.ExitCode -ne 0 -and [string]::IsNullOrWhiteSpace($result.Reply)) {
                     $errText = "codex exec exit=$($result.ExitCode). stderr:`n$($result.Stderr)"
