@@ -1,0 +1,42 @@
+{
+  "client_version": "0.144.0",
+  "fetched_at": "2026-07-09T00:00:00Z",
+  "models": [
+    {
+      "slug": "gpt-test-frontier",
+      "display_name": "GPT Test Frontier",
+      "description": "Fixture frontier model",
+      "priority": 0,
+      "visibility": "list",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {"effort": "low", "description": "Low"},
+        {"effort": "medium", "description": "Medium"},
+        {"effort": "high", "description": "High"},
+        {"effort": "xhigh", "description": "Extra high"}
+      ],
+      "additional_speed_tiers": ["fast"]
+    },
+    {
+      "slug": "gpt-test-fast",
+      "display_name": "GPT Test Fast",
+      "description": "Fixture fast model",
+      "priority": 10,
+      "visibility": "list",
+      "default_reasoning_level": "high",
+      "supported_reasoning_levels": [
+        {"effort": "low", "description": "Low"},
+        {"effort": "high", "description": "High"}
+      ]
+    },
+    {
+      "slug": "gpt-test-hidden",
+      "display_name": "GPT Test Hidden",
+      "description": "Fixture hidden model",
+      "priority": 99,
+      "visibility": "hide",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [{"effort": "medium", "description": "Medium"}]
+    }
+  ]
+}

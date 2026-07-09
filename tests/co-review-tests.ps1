@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param()
+param([string]$Only = "")
 
 $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
@@ -88,10 +88,103 @@ public static class Program {
     }
 }
 
-Test-InvalidPairIdsRejected
-Test-ArchiveDoesNotEscapePairRoot
-Test-PurgePairDeletesPairDir
-Test-ListenerReturnsTimeoutError
+function Test-CapabilityDiscovery {
+    $fixture = Join-Path $RepoRoot "tests\fixtures\models-cache.json"
+    . (Join-Path $Scripts "common.ps1")
+
+    Assert-SafeCodexConfigOverrides -Overrides @("features.web_search=true", "network_access=false")
+    $reservedOverrideRejected = $false
+    try {
+        Assert-SafeCodexConfigOverrides -Overrides @("model=gpt-test-frontier")
+    } catch {
+        $reservedOverrideRejected = $true
+    }
+    Assert-True $reservedOverrideRejected "dedicated Codex options should be rejected as generic overrides"
+
+    $humanOutput = & (Join-Path $Scripts "get-capabilities.ps1") -ModelsCachePath $fixture | Out-String
+    Assert-True ($humanOutput -match "gpt-test-frontier") "human output should include the frontier model"
+    Assert-True ($humanOutput -match "gpt-test-fast") "human output should include the fast model"
+    Assert-True ($humanOutput -notmatch "gpt-test-hidden") "human output should exclude hidden models"
+
+    $capabilities = Get-CodexCapabilities -ModelsCachePath $fixture
+    $modelSlugs = @($capabilities.models | ForEach-Object { $_.slug })
+    Assert-True ($modelSlugs -contains "gpt-test-frontier") "capabilities should include the frontier model"
+    Assert-True ($modelSlugs -contains "gpt-test-fast") "capabilities should include the fast model"
+    Assert-True ($modelSlugs -notcontains "gpt-test-hidden") "capabilities should exclude hidden models"
+    $hiddenCapabilities = Get-CodexCapabilities -ModelsCachePath $fixture -IncludeHidden
+    Assert-True (@($hiddenCapabilities.models | ForEach-Object { $_.slug }) -contains "gpt-test-hidden") "IncludeHidden should expose hidden models"
+
+    $hiddenFirstCachePath = Join-Path ([System.IO.Path]::GetTempPath()) ("co-review-models-" + [System.Guid]::NewGuid().ToString("N") + ".json")
+    try {
+        $hiddenFirstCache = Get-Content -LiteralPath $fixture -Raw | ConvertFrom-Json
+        $hiddenFirstCache.models[2].priority = -1
+        $hiddenFirstCache | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $hiddenFirstCachePath -Encoding UTF8
+        $hiddenFirstDefaults = Get-CodexCapabilities -ModelsCachePath $hiddenFirstCachePath -IncludeHidden -CodexBin "missing-codex.exe"
+        Assert-True ($hiddenFirstDefaults.defaults.model -eq "gpt-test-frontier") "defaults should never advertise a hidden model"
+    } finally {
+        Remove-Item -LiteralPath $hiddenFirstCachePath -Force -ErrorAction SilentlyContinue
+    }
+
+    $jsonCapabilities = & (Join-Path $Scripts "get-capabilities.ps1") -ModelsCachePath $fixture -Json | ConvertFrom-Json
+    Assert-True (@($jsonCapabilities.models).Count -eq 2) "JSON output should contain the complete visible model list"
+
+    $automatic = Resolve-CodexSelection -Capabilities $capabilities -Model "auto" -Reasoning "auto"
+    Assert-True ($automatic.model -eq "gpt-test-frontier") "auto model should select the highest-priority visible model"
+    Assert-True ($automatic.reasoning -eq "medium") "auto reasoning should use the selected model default"
+
+    $hiddenFirstCapabilities = [PSCustomObject]@{
+        models = @(
+            [PSCustomObject]@{
+                slug = "hidden-first"
+                priority = -1
+                visibility = "hide"
+                default_reasoning_level = "medium"
+                supported_reasoning_levels = @([PSCustomObject]@{ effort = "medium" })
+            },
+            $capabilities.models[0]
+        )
+    }
+    $visibleAutomatic = Resolve-CodexSelection -Capabilities $hiddenFirstCapabilities -Model "auto" -Reasoning "auto"
+    Assert-True ($visibleAutomatic.model -eq "gpt-test-frontier") "auto model should never select a hidden model"
+
+    $xhigh = Resolve-CodexSelection -Capabilities $capabilities -Model "gpt-test-frontier" -Reasoning "xhigh"
+    Assert-True ($xhigh.reasoning -eq "xhigh") "frontier model should accept advertised xhigh reasoning"
+
+    $unsupportedRejected = $false
+    try {
+        Resolve-CodexSelection -Capabilities $capabilities -Model "gpt-test-fast" -Reasoning "medium" | Out-Null
+    } catch {
+        $unsupportedRejected = $true
+    }
+    Assert-True $unsupportedRejected "fast model should reject unsupported medium reasoning"
+
+    Assert-True ($capabilities.modes -contains "review") "capabilities should expose review mode"
+    Assert-True ($capabilities.modes -contains "workhorse") "capabilities should expose workhorse mode"
+    Assert-True ($capabilities.sandboxes -contains "read-only") "capabilities should expose read-only sandbox"
+    Assert-True ($capabilities.sandboxes -contains "workspace-write") "capabilities should expose workspace-write sandbox"
+    Assert-True ($capabilities.sandboxes -contains "danger-full-access") "capabilities should expose danger-full-access sandbox"
+}
+
+$TestGroups = [ordered]@{
+    PathSafety = {
+        Test-InvalidPairIdsRejected
+        Test-ArchiveDoesNotEscapePairRoot
+    }
+    Purge = { Test-PurgePairDeletesPairDir }
+    Timeout = { Test-ListenerReturnsTimeoutError }
+    CapabilityDiscovery = { Test-CapabilityDiscovery }
+}
+
+if ($Only) {
+    if (-not $TestGroups.Contains($Only)) {
+        throw "Unknown test group '$Only'. Available groups: $($TestGroups.Keys -join ', ')"
+    }
+    & $TestGroups[$Only]
+} else {
+    foreach ($group in $TestGroups.GetEnumerator()) {
+        & $group.Value
+    }
+}
 
 # All asserts passed if we got here. Clear any non-zero $LASTEXITCODE that leaked
 # from Invoke-ScriptExpectFailure (where we INTENTIONALLY ran scripts that exit non-zero).
