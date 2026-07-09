@@ -101,6 +101,22 @@ function Test-CapabilityDiscovery {
     }
     Assert-True $reservedOverrideRejected "dedicated Codex options should be rejected as generic overrides"
 
+    $malformedOverrideRejected = $false
+    try {
+        Assert-SafeCodexConfigOverrides -Overrides @("not-an-assignment")
+    } catch {
+        $malformedOverrideRejected = $true
+    }
+    Assert-True $malformedOverrideRejected "malformed Codex config overrides should be rejected"
+
+    $multiAgentOverrideRejected = $false
+    try {
+        Assert-SafeCodexConfigOverrides -Overrides @("features.multi_agent=true")
+    } catch {
+        $multiAgentOverrideRejected = $true
+    }
+    Assert-True $multiAgentOverrideRejected "features.multi_agent should be rejected as a generic override"
+
     $humanOutput = & (Join-Path $Scripts "get-capabilities.ps1") -ModelsCachePath $fixture | Out-String
     Assert-True ($humanOutput -match "gpt-test-frontier") "human output should include the frontier model"
     Assert-True ($humanOutput -match "gpt-test-fast") "human output should include the fast model"
@@ -131,6 +147,23 @@ function Test-CapabilityDiscovery {
     $automatic = Resolve-CodexSelection -Capabilities $capabilities -Model "auto" -Reasoning "auto"
     Assert-True ($automatic.model -eq "gpt-test-frontier") "auto model should select the highest-priority visible model"
     Assert-True ($automatic.reasoning -eq "medium") "auto reasoning should use the selected model default"
+
+    $inconsistentCapabilities = [PSCustomObject]@{
+        models = @([PSCustomObject]@{
+            slug = "inconsistent-default"
+            priority = 0
+            visibility = "list"
+            default_reasoning_level = "medium"
+            supported_reasoning_levels = @([PSCustomObject]@{ effort = "low" })
+        })
+    }
+    $inconsistentDefaultRejected = $false
+    try {
+        Resolve-CodexSelection -Capabilities $inconsistentCapabilities -Model "inconsistent-default" -Reasoning "auto" | Out-Null
+    } catch {
+        $inconsistentDefaultRejected = $true
+    }
+    Assert-True $inconsistentDefaultRejected "auto reasoning should reject a default not advertised as supported"
 
     $hiddenFirstCapabilities = [PSCustomObject]@{
         models = @(

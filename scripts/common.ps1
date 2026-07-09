@@ -226,10 +226,11 @@ function Resolve-CodexSelection {
         } else {
             $reasoningSource = "configured-default"
         }
-    } elseif ($null -ne $selectedModel) {
+    }
+    if ($null -ne $selectedModel) {
         $supported = @($selectedModel.supported_reasoning_levels | ForEach-Object { [string]$_.effort })
-        if ($supported -notcontains $Reasoning) {
-            throw "Model '$resolvedModel' does not support reasoning level '$Reasoning'. Supported levels: $($supported -join ', ')"
+        if ($supported -notcontains $resolvedReasoning) {
+            throw "Model '$resolvedModel' does not support reasoning level '$resolvedReasoning'. Supported levels: $($supported -join ', ')"
         }
     }
 
