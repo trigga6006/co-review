@@ -13,5 +13,8 @@ desktop.ini
 # Local test artifacts (the suite cleans up, but defensive)
 /tests/tmp/
 
+# Isolated implementation worktrees
+/.worktrees/
+
 # Dependency caches (none today, defensive)
 node_modules/
