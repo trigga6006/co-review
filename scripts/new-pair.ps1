@@ -88,7 +88,7 @@ foreach ($dir in $AddDir) {
 $requestedCodexModel = $CodexModel
 $requestedCodexReasoning = $CodexReasoning
 $capabilities = Get-CodexCapabilities -CodexBin $CodexBin
-$selection = Resolve-CodexSelection -Capabilities $capabilities -Model $requestedCodexModel -Reasoning $requestedCodexReasoning
+$selection = Resolve-CodexSelection -Capabilities $capabilities -Model $requestedCodexModel -Reasoning $requestedCodexReasoning -AllowUnknownModel
 $CodexModel = [string]$selection.model
 $CodexReasoning = [string]$selection.reasoning
 

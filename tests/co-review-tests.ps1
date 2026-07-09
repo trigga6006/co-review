@@ -239,8 +239,9 @@ function Test-WorkerModes {
     $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("co-review-worker-modes-" + [System.Guid]::NewGuid().ToString("N"))
     $fakeDir = Join-Path $tempRoot "fake"
     $codexHome = Join-Path $tempRoot "codex-home"
+    $missingCodexHome = Join-Path $tempRoot "missing-codex-home"
     $extraDir = Join-Path $tempRoot "extra dir"
-    New-Item -ItemType Directory -Path $codexHome,$extraDir -Force | Out-Null
+    New-Item -ItemType Directory -Path $codexHome,$missingCodexHome,$extraDir -Force | Out-Null
     Copy-Item -LiteralPath (Join-Path $RepoRoot "tests\fixtures\models-cache.json") -Destination (Join-Path $codexHome "models_cache.json")
     $fakeCodex = New-FakeCodex -Directory $fakeDir
     $oldCodexHome = $env:CODEX_HOME
@@ -248,8 +249,31 @@ function Test-WorkerModes {
     $review = $null
     $workhorse = $null
     $tampered = $null
+    $legacy = $null
 
     try {
+        $env:CODEX_HOME = $missingCodexHome
+        try {
+            $legacyJson = & (Join-Path $Scripts "new-pair.ps1") -NoSpawn -Task "legacy missing-cache pair" -WorkerName "legacy" -CodexBin $fakeCodex | Select-Object -Last 1
+            $legacy = $legacyJson | ConvertFrom-Json
+            $missingAuto = Invoke-ScriptExpectFailure -ScriptName "new-pair.ps1" -ScriptArgs @("-NoSpawn", "-Task", "missing auto", "-CodexBin", $fakeCodex, "-CodexModel", "auto", "-CodexReasoning", "auto")
+            Assert-True ($missingAuto.ExitCode -ne 0) "auto pair selection should require a discoverable model"
+            Assert-True ($missingAuto.Output -match "no visible models were discovered") "missing-cache auto selection should explain the missing discoverable default"
+        } finally {
+            $env:CODEX_HOME = $codexHome
+        }
+        $legacyMeta = Get-Content -LiteralPath (Join-Path $legacy.pair_dir "pair.json") -Raw | ConvertFrom-Json
+        Assert-True ($legacyMeta.requested_model -eq "gpt-5.5") "missing cache should preserve the pinned legacy model request"
+        Assert-True ($legacyMeta.codex_model -eq "gpt-5.5") "missing cache should allow the explicit legacy model"
+        Assert-True ($legacyMeta.requested_reasoning -eq "medium") "missing cache should preserve the pinned legacy reasoning request"
+        Assert-True ($legacyMeta.codex_reasoning -eq "medium") "missing cache should allow explicit legacy reasoning"
+        & (Join-Path $Scripts "purge-pair.ps1") -PairId $legacy.pair_id -Force | Out-Null
+        $legacy = $null
+
+        $unsupportedPair = Invoke-ScriptExpectFailure -ScriptName "new-pair.ps1" -ScriptArgs @("-NoSpawn", "-Task", "unsupported reasoning", "-CodexBin", $fakeCodex, "-CodexModel", "gpt-test-fast", "-CodexReasoning", "medium")
+        Assert-True ($unsupportedPair.ExitCode -ne 0) "discovered models should reject unsupported pair-level reasoning"
+        Assert-True ($unsupportedPair.Output -match "does not support reasoning level 'medium'") "unsupported discovered reasoning should report the model capability mismatch"
+
         $reviewJson = & (Join-Path $Scripts "new-pair.ps1") -NoSpawn -Task "review task" -WorkerName "reviewer" -Mode review -CodexBin $fakeCodex -CodexModel "gpt-test-frontier" -CodexReasoning medium | Select-Object -Last 1
         $review = $reviewJson | ConvertFrom-Json
         $reviewMeta = Get-Content -LiteralPath (Join-Path $review.pair_dir "pair.json") -Raw | ConvertFrom-Json
@@ -336,6 +360,7 @@ function Test-WorkerModes {
         if ($null -ne $review -and (Test-Path -LiteralPath $review.pair_dir)) { & (Join-Path $Scripts "purge-pair.ps1") -PairId $review.pair_id -Force | Out-Null }
         if ($null -ne $workhorse -and (Test-Path -LiteralPath $workhorse.pair_dir)) { & (Join-Path $Scripts "purge-pair.ps1") -PairId $workhorse.pair_id -Force | Out-Null }
         if ($null -ne $tampered -and (Test-Path -LiteralPath $tampered.pair_dir)) { & (Join-Path $Scripts "purge-pair.ps1") -PairId $tampered.pair_id -Force | Out-Null }
+        if ($null -ne $legacy -and (Test-Path -LiteralPath $legacy.pair_dir)) { & (Join-Path $Scripts "purge-pair.ps1") -PairId $legacy.pair_id -Force | Out-Null }
         $env:CODEX_HOME = $oldCodexHome
         Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
