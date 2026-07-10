@@ -35,15 +35,7 @@ if ([string]::IsNullOrWhiteSpace($ProjectCwd)) { $ProjectCwd = (Get-Location).Pa
 $sourceProjectCwd = Get-CanonicalDirectory -Path $ProjectCwd
 
 if ([string]::IsNullOrWhiteSpace($CodexBin)) {
-    $candidates = @(
-        "$env:LOCALAPPDATA\OpenAI\Codex\bin\codex.exe",
-        "$env:USERPROFILE\AppData\Local\OpenAI\Codex\bin\codex.exe"
-    )
-    foreach ($candidate in $candidates) { if (Test-Path -LiteralPath $candidate) { $CodexBin = $candidate; break } }
-    if ([string]::IsNullOrWhiteSpace($CodexBin)) {
-        $command = Get-Command codex -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($null -ne $command) { $CodexBin = $command.Source }
-    }
+    $CodexBin = Resolve-CodexBin
 }
 Assert-ValidCodexBin -CodexBin $CodexBin
 Assert-SafeCodexConfigOverrides -Overrides $ConfigOverride

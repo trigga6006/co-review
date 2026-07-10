@@ -28,7 +28,8 @@ function New-FakeCodex {
     param(
         [Parameter(Mandatory=$true)][string]$Directory,
         [int]$SleepMs = 0,
-        [int]$ExitCode = 0
+        [int]$ExitCode = 0,
+        [string]$Version = "0.999.0"
     )
 
     New-Item -ItemType Directory -Path $Directory -Force | Out-Null
@@ -42,7 +43,7 @@ using System.Threading;
 public static class $typeName {
     public static int Main(string[] args) {
         if (args.Length == 1 && args[0] == "--version") {
-            Console.WriteLine("codex-cli 0.999.0-test");
+            Console.WriteLine("codex-cli $Version-test");
             return 0;
         }
 
@@ -68,9 +69,23 @@ public static class $typeName {
         return $ExitCode;
     }
 }
+
 "@
     Add-Type -TypeDefinition $source -OutputAssembly $fakeCodex -OutputType ConsoleApplication
     return $fakeCodex
+}
+
+function Test-CodexBinaryResolution {
+    . (Join-Path $Scripts "common.ps1")
+    $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("co-review-bin-" + [System.Guid]::NewGuid().ToString("N"))
+    try {
+        $older = New-FakeCodex -Directory (Join-Path $tempRoot "desktop") -Version "0.130.0"
+        $newer = New-FakeCodex -Directory (Join-Path $tempRoot "cli") -Version "0.144.0"
+        $resolved = Resolve-CodexBin -Candidates @($older, $newer)
+        Assert-True ($resolved -eq $newer) "automatic binary resolution should select the newest installed Codex"
+    } finally {
+        Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Test-InvalidPairIdsRejected {
@@ -819,6 +834,7 @@ function Test-BackwardCompatibility {
 }
 
 $TestGroups = [ordered]@{
+    BinaryResolution = { Test-CodexBinaryResolution }
     PathSafety = {
         Test-InvalidPairIdsRejected
         Test-ArchiveDoesNotEscapePairRoot

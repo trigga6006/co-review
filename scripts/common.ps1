@@ -46,6 +46,43 @@ function Assert-ValidCodexBin {
     }
 }
 
+function Resolve-CodexBin {
+    param([string[]]$Candidates = @())
+
+    if ($Candidates.Count -eq 0) {
+        $discovered = @()
+        if (-not [string]::IsNullOrWhiteSpace($env:APPDATA)) {
+            $npmPattern = Join-Path $env:APPDATA "npm\node_modules\@openai\codex\node_modules\@openai\codex-win32-*\vendor\*\bin\codex.exe"
+            $discovered += @(Get-ChildItem -Path $npmPattern -File -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+        }
+        if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+            $discovered += (Join-Path $env:LOCALAPPDATA "OpenAI\Codex\bin\codex.exe")
+        }
+        $commands = @(Get-Command codex -All -ErrorAction SilentlyContinue)
+        $discovered += @($commands | ForEach-Object { $_.Source })
+        $Candidates = $discovered
+    }
+
+    $valid = @()
+    foreach ($candidate in @($Candidates | Select-Object -Unique)) {
+        if ([string]::IsNullOrWhiteSpace($candidate) -or -not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
+        if ([System.IO.Path]::GetFileName($candidate) -notin @("codex.exe", "codex")) { continue }
+        try {
+            $versionLine = (& $candidate --version 2>$null | Select-Object -First 1)
+            if ([string]$versionLine -match '(\d+\.\d+\.\d+)') {
+                $valid += [pscustomobject]@{ path = $candidate; version = [version]$Matches[1] }
+            }
+        } catch { }
+    }
+
+    $selected = $valid | Sort-Object version -Descending | Select-Object -First 1
+    if ($null -eq $selected) {
+        Write-Error "Could not locate a runnable Codex executable. Pass -CodexBin <path> or install Codex CLI."
+        exit 1
+    }
+    return [string]$selected.path
+}
+
 function Get-CodexCapabilities {
     param([string]$ModelsCachePath = "", [switch]$IncludeHidden, [string]$CodexBin = "", [int]$MaxCacheAgeHours = 168)
 

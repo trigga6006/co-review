@@ -28,12 +28,7 @@ $ErrorActionPreference = "Stop"
 
 if ([string]::IsNullOrWhiteSpace($ProjectCwd)) { $ProjectCwd = (Get-Location).Path }
 if ([string]::IsNullOrWhiteSpace($CodexBin)) {
-    $candidate = "$env:LOCALAPPDATA\OpenAI\Codex\bin\codex.exe"
-    if (Test-Path -LiteralPath $candidate) { $CodexBin = $candidate }
-    else {
-        $command = Get-Command codex -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($null -ne $command) { $CodexBin = $command.Source }
-    }
+    $CodexBin = Resolve-CodexBin
 }
 Assert-ValidCodexBin -CodexBin $CodexBin
 $capabilities = Get-CodexCapabilities -CodexBin $CodexBin
