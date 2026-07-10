@@ -47,7 +47,7 @@ function Assert-ValidCodexBin {
 }
 
 function Get-CodexCapabilities {
-    param([string]$ModelsCachePath = "", [switch]$IncludeHidden, [string]$CodexBin = "")
+    param([string]$ModelsCachePath = "", [switch]$IncludeHidden, [string]$CodexBin = "", [int]$MaxCacheAgeHours = 168)
 
     if ([string]::IsNullOrWhiteSpace($ModelsCachePath)) {
         if (-not [string]::IsNullOrWhiteSpace($env:CODEX_HOME)) {
@@ -67,10 +67,24 @@ function Get-CodexCapabilities {
 
     $cache = $null
     $source = "missing-cache"
+    $cacheFetchedAt = $null
+    $cacheAgeHours = $null
+    $cacheStale = $false
     if (Test-Path -LiteralPath $cachePath -PathType Leaf) {
         try {
             $cache = Get-Content -LiteralPath $cachePath -Raw | ConvertFrom-Json -ErrorAction Stop
             $source = "models-cache"
+            if ($null -ne $cache.PSObject.Properties["fetched_at"] -and -not [string]::IsNullOrWhiteSpace([string]$cache.fetched_at)) {
+                $parsedFetchedAt = [DateTimeOffset]::MinValue
+                if ([DateTimeOffset]::TryParse([string]$cache.fetched_at, [ref]$parsedFetchedAt)) {
+                    $cacheFetchedAt = $parsedFetchedAt.ToUniversalTime().ToString("o")
+                    $cacheAgeHours = [Math]::Max(0, ([DateTimeOffset]::UtcNow - $parsedFetchedAt.ToUniversalTime()).TotalHours)
+                    if ($MaxCacheAgeHours -gt 0 -and $cacheAgeHours -gt $MaxCacheAgeHours) {
+                        $cacheStale = $true
+                        $source = "stale-models-cache"
+                    }
+                }
+            }
         } catch {
             $source = "invalid-cache"
         }
@@ -156,7 +170,7 @@ function Get-CodexCapabilities {
     $defaultModel = "configured-default"
     $defaultReasoning = "auto"
     $defaultModels = @($models | Where-Object { $_.visibility -eq "list" })
-    if ($defaultModels.Count -gt 0) {
+    if (-not $cacheStale -and $defaultModels.Count -gt 0) {
         $defaultModel = [string]$defaultModels[0].slug
         $defaultReasoning = [string]$defaultModels[0].default_reasoning_level
     }
@@ -164,6 +178,9 @@ function Get-CodexCapabilities {
     return [PSCustomObject]@{
         source = $source
         cache_path = $cachePath
+        cache_fetched_at = $cacheFetchedAt
+        cache_age_hours = $cacheAgeHours
+        cache_stale = $cacheStale
         cli_version = $cliVersion
         models = @($models)
         modes = @("review", "workhorse")
@@ -195,6 +212,9 @@ function Resolve-CodexSelection {
     $modelSource = "explicit"
 
     if ($Model -eq "auto") {
+        if ($Capabilities.cache_stale -eq $true) {
+            throw "Cannot resolve model 'auto': the discovered Codex model cache is stale"
+        }
         $visibleModels = @($availableModels | Where-Object { $_.visibility -eq "list" })
         if ($visibleModels.Count -eq 0) {
             throw "Cannot resolve model 'auto': no visible models were discovered"
@@ -321,11 +341,46 @@ function Get-NormalizedPairMetadata {
         $meta | Add-Member -NotePropertyName window_mode -NotePropertyValue "Minimized" -Force
         $meta | Add-Member -NotePropertyName codex_timeout_sec -NotePropertyValue 1800 -Force
         $meta | Add-Member -NotePropertyName dry_run_listener -NotePropertyValue $false -Force
+        $meta | Add-Member -NotePropertyName profile -NotePropertyValue "" -Force
+        $meta | Add-Member -NotePropertyName add_dirs -NotePropertyValue @() -Force
+        $meta | Add-Member -NotePropertyName search_enabled -NotePropertyValue $false -Force
+        $meta | Add-Member -NotePropertyName config_overrides -NotePropertyValue @() -Force
     }
     if ([string]::IsNullOrWhiteSpace([string]$meta.worker_name)) {
         $meta | Add-Member -NotePropertyName worker_name -NotePropertyValue ([string]$meta.pair_id) -Force
     }
     return $meta
+}
+
+function Get-CoReviewMutexName {
+    param(
+        [Parameter(Mandatory=$true)][ValidatePattern('^[A-Za-z0-9-]+$')][string]$Scope,
+        [Parameter(Mandatory=$true)][string]$Key
+    )
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Key.ToLowerInvariant())
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { $hash = ([System.BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant() }
+    finally { $sha.Dispose() }
+    return "Global\co-review-$Scope-$hash"
+}
+
+function Invoke-WithCoReviewMutex {
+    param(
+        [Parameter(Mandatory=$true)][string]$Name,
+        [Parameter(Mandatory=$true)][scriptblock]$ScriptBlock,
+        [int]$TimeoutMs = 30000
+    )
+    $mutex = New-Object System.Threading.Mutex($false, $Name)
+    $locked = $false
+    try {
+        try { $locked = $mutex.WaitOne($TimeoutMs) }
+        catch [System.Threading.AbandonedMutexException] { $locked = $true }
+        if (-not $locked) { throw "Timed out waiting for co-review lock '$Name'" }
+        & $ScriptBlock
+    } finally {
+        if ($locked) { $mutex.ReleaseMutex() | Out-Null }
+        $mutex.Dispose()
+    }
 }
 
 function Test-CoReviewListenerAlive {
@@ -355,6 +410,77 @@ function Test-CoReviewListenerAlive {
     }
 }
 
+function Resolve-CoReviewWindowStyle {
+    param([Parameter(Mandatory=$true)][string]$WindowMode)
+    switch ($WindowMode) {
+        "Hidden" { return "Hidden" }
+        "Minimized" { return "Minimized" }
+        "Foreground" { return "Normal" }
+        default { throw "Invalid window mode '$WindowMode'" }
+    }
+}
+
+function ConvertTo-CoReviewCommandLineArgument {
+    param([AllowNull()][string]$Value)
+    if ($null -eq $Value -or $Value.Length -eq 0) { return '""' }
+    if ($Value -notmatch '[\s"]') { return $Value }
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('"')
+    for ($i = 0; $i -lt $Value.Length; $i++) {
+        $backslashes = 0
+        while ($i -lt $Value.Length -and $Value[$i] -eq '\') { $backslashes++; $i++ }
+        if ($i -eq $Value.Length) {
+            [void]$sb.Append('\' * ($backslashes * 2))
+            break
+        } elseif ($Value[$i] -eq '"') {
+            [void]$sb.Append('\' * ($backslashes * 2 + 1))
+            [void]$sb.Append('"')
+        } else {
+            [void]$sb.Append('\' * $backslashes)
+            [void]$sb.Append($Value[$i])
+        }
+    }
+    [void]$sb.Append('"')
+    return $sb.ToString()
+}
+
+function Stop-CoReviewProcessTree {
+    param([Parameter(Mandatory=$true)][int]$ProcessId, [int]$TimeoutSec = 5)
+    if ($null -eq (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) { return }
+
+    $snapshot = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+    $treeIds = New-Object System.Collections.Generic.List[int]
+    $pending = New-Object System.Collections.Generic.Queue[int]
+    $pending.Enqueue($ProcessId)
+    while ($pending.Count -gt 0) {
+        $parentId = $pending.Dequeue()
+        foreach ($child in @($snapshot | Where-Object { $_.ParentProcessId -eq $parentId })) {
+            $childId = [int]$child.ProcessId
+            if (-not $treeIds.Contains($childId)) {
+                $treeIds.Add($childId)
+                $pending.Enqueue($childId)
+            }
+        }
+    }
+    $treeIds.Add($ProcessId)
+
+    & taskkill.exe /PID $ProcessId /T /F 2>$null | Out-Null
+    $taskkillExitCode = $LASTEXITCODE
+    $remainingIds = @($treeIds | Where-Object { $null -ne (Get-Process -Id $_ -ErrorAction SilentlyContinue) })
+    if ($taskkillExitCode -ne 0 -or $remainingIds.Count -gt 0) {
+        $killIds = @($treeIds.ToArray())
+        [Array]::Reverse($killIds)
+        foreach ($id in $killIds) {
+            Stop-Process -Id $id -Force -ErrorAction SilentlyContinue
+        }
+    }
+    foreach ($id in $treeIds) { Wait-Process -Id $id -Timeout $TimeoutSec -ErrorAction SilentlyContinue }
+    $remainingIds = @($treeIds | Where-Object { $null -ne (Get-Process -Id $_ -ErrorAction SilentlyContinue) })
+    if ($remainingIds.Count -gt 0) {
+        throw "Could not stop process tree rooted at PID $ProcessId; remaining PIDs: $($remainingIds -join ', ')"
+    }
+}
+
 function Start-CoReviewListener {
     param(
         [Parameter(Mandatory=$true)][string]$PairId,
@@ -365,7 +491,7 @@ function Start-CoReviewListener {
 
     $meta = Get-NormalizedPairMetadata -PairDir $PairDir
     if ([string]::IsNullOrWhiteSpace($WindowMode)) { $WindowMode = [string]$meta.window_mode }
-    if ($WindowMode -notin @("Hidden", "Minimized", "Foreground")) { throw "Invalid window mode '$WindowMode'" }
+    $processWindowStyle = Resolve-CoReviewWindowStyle -WindowMode $WindowMode
     $projectCwd = [string]$meta.project_cwd
     if ([string]::IsNullOrWhiteSpace($projectCwd) -or -not (Test-Path -LiteralPath $projectCwd -PathType Container)) {
         throw "Worker working directory does not exist: $projectCwd"
@@ -374,7 +500,8 @@ function Start-CoReviewListener {
     $listenerPath = Join-Path $PSScriptRoot "codex-listener.ps1"
     $arguments = @("-NoProfile", "-File", $listenerPath, "-PairId", $PairId, "-CodexBin", [string]$meta.codex_bin)
     if ($meta.dry_run_listener -eq $true) { $arguments += "-DryRun" }
-    $process = Start-Process -FilePath "powershell.exe" -ArgumentList $arguments -WorkingDirectory $projectCwd -WindowStyle $WindowMode -PassThru -ErrorAction Stop
+    $argumentString = ($arguments | ForEach-Object { ConvertTo-CoReviewCommandLineArgument -Value $_ }) -join " "
+    $process = Start-Process -FilePath "powershell.exe" -ArgumentList $argumentString -WorkingDirectory $projectCwd -WindowStyle $processWindowStyle -PassThru -ErrorAction Stop
 
     $listenerPid = $null
     $deadline = (Get-Date).AddSeconds($StartupWaitSec)
@@ -382,6 +509,10 @@ function Start-CoReviewListener {
         if (Test-CoReviewListenerAlive -PairDir $PairDir -ListenerPid ([ref]$listenerPid)) { break }
         if ($process.HasExited) { throw "Listener process exited during startup for $PairId" }
         Start-Sleep -Milliseconds 200
+    }
+    if (-not (Test-CoReviewListenerAlive -PairDir $PairDir -ListenerPid ([ref]$listenerPid))) {
+        if (-not $process.HasExited) { Stop-CoReviewProcessTree -ProcessId $process.Id }
+        throw "Listener did not report a validated PID within ${StartupWaitSec}s for $PairId"
     }
     return [PSCustomObject]@{
         spawned = $true
@@ -421,7 +552,7 @@ function Test-WriterLeaseOwnerLive {
     return $false
 }
 
-function Try-AcquireWriterLease {
+function Try-AcquireWriterLeaseUnlocked {
     param(
         [Parameter(Mandatory=$true)][string]$PairId,
         [Parameter(Mandatory=$true)][string]$PairDir,
@@ -464,6 +595,19 @@ function Try-AcquireWriterLease {
     throw "Could not acquire writer lease for $canonical"
 }
 
+function Try-AcquireWriterLease {
+    param(
+        [Parameter(Mandatory=$true)][string]$PairId,
+        [Parameter(Mandatory=$true)][string]$PairDir,
+        [Parameter(Mandatory=$true)][string]$WorkingDirectory
+    )
+    $canonical = Get-CanonicalDirectory -Path $WorkingDirectory
+    $mutexName = Get-CoReviewMutexName -Scope "writer-lease" -Key $canonical
+    Invoke-WithCoReviewMutex -Name $mutexName -ScriptBlock {
+        Try-AcquireWriterLeaseUnlocked -PairId $PairId -PairDir $PairDir -WorkingDirectory $canonical
+    }
+}
+
 function Acquire-WriterLease {
     param(
         [Parameter(Mandatory=$true)][string]$PairId,
@@ -477,11 +621,21 @@ function Acquire-WriterLease {
     return $result
 }
 
-function Release-WriterLease {
+function Release-WriterLeaseUnlocked {
     param([Parameter(Mandatory=$true)][string]$PairId, [Parameter(Mandatory=$true)][string]$WorkingDirectory)
     if ([string]::IsNullOrWhiteSpace($WorkingDirectory) -or -not (Test-Path -LiteralPath $WorkingDirectory -PathType Container)) { return }
     $leasePath = Get-WriterLeasePath -WorkingDirectory $WorkingDirectory
     if (-not (Test-Path -LiteralPath $leasePath -PathType Leaf)) { return }
     try { $lease = Get-Content -LiteralPath $leasePath -Raw | ConvertFrom-Json } catch { return }
     if ([string]$lease.pair_id -eq $PairId) { Remove-Item -LiteralPath $leasePath -Force -ErrorAction SilentlyContinue }
+}
+
+function Release-WriterLease {
+    param([Parameter(Mandatory=$true)][string]$PairId, [Parameter(Mandatory=$true)][string]$WorkingDirectory)
+    if ([string]::IsNullOrWhiteSpace($WorkingDirectory) -or -not (Test-Path -LiteralPath $WorkingDirectory -PathType Container)) { return }
+    $canonical = Get-CanonicalDirectory -Path $WorkingDirectory
+    $mutexName = Get-CoReviewMutexName -Scope "writer-lease" -Key $canonical
+    Invoke-WithCoReviewMutex -Name $mutexName -ScriptBlock {
+        Release-WriterLeaseUnlocked -PairId $PairId -WorkingDirectory $canonical
+    }
 }

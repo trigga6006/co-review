@@ -27,7 +27,8 @@ function Invoke-ScriptExpectFailure {
 function New-FakeCodex {
     param(
         [Parameter(Mandatory=$true)][string]$Directory,
-        [int]$SleepMs = 0
+        [int]$SleepMs = 0,
+        [int]$ExitCode = 0
     )
 
     New-Item -ItemType Directory -Path $Directory -Force | Out-Null
@@ -64,7 +65,7 @@ public static class $typeName {
             }
         }
         Console.WriteLine("{\"type\":\"thread.started\",\"thread_id\":\"fake-thread\"}");
-        return 0;
+        return $ExitCode;
     }
 }
 "@
@@ -133,7 +134,8 @@ function Invoke-WorkerModeTurn {
         [string]$FollowUpMessage = "",
         [string]$Model = "",
         [string]$Reasoning = "",
-        [int]$TurnTimeoutSec = 0
+        [int]$TurnTimeoutSec = 0,
+        [switch]$ExpectError
     )
 
     New-Item -ItemType Directory -Path $CaptureDir -Force | Out-Null
@@ -165,7 +167,11 @@ function Invoke-WorkerModeTurn {
         if ($TurnTimeoutSec -gt 0) { $askArgs.TurnTimeoutSec = $TurnTimeoutSec }
         $replyJson = & (Join-Path $Scripts "ask.ps1") @askArgs | Select-Object -Last 1
         $reply = $replyJson | ConvertFrom-Json
-        Assert-True ($reply.content -eq "fake codex reply") "fake Codex reply should round-trip through the listener"
+        if ($ExpectError) {
+            Assert-True ($reply.type -eq "error" -and -not [string]::IsNullOrWhiteSpace([string]$reply.error)) "nonzero Codex exit should produce a correlated error reply"
+        } else {
+            Assert-True ($reply.content -eq "fake codex reply") "fake Codex reply should round-trip through the listener"
+        }
 
         if (-not [string]::IsNullOrWhiteSpace($FollowUpMessage)) {
             $askArgs.Message = $FollowUpMessage
@@ -187,6 +193,7 @@ function Invoke-WorkerModeTurn {
             Args = @(Get-Content -LiteralPath $argsPath -Encoding UTF8)
             Stdin = [System.IO.File]::ReadAllText($stdinPath)
             Queue = ($queueLine | ConvertFrom-Json)
+            Reply = $reply
         }
     } finally {
         & (Join-Path $Scripts "end-pair.ps1") -PairId $Pair.pair_id -Delete | Out-Null
@@ -248,6 +255,8 @@ function Test-WorkerModes {
     $env:CODEX_HOME = $codexHome
     $review = $null
     $workhorse = $null
+    $configuredDefault = $null
+    $failing = $null
     $tampered = $null
     $legacy = $null
 
@@ -269,6 +278,20 @@ function Test-WorkerModes {
         Assert-True ($legacyMeta.codex_reasoning -eq "medium") "missing cache should allow explicit legacy reasoning"
         & (Join-Path $Scripts "purge-pair.ps1") -PairId $legacy.pair_id -Force | Out-Null
         $legacy = $null
+
+        $configuredDefaultJson = & (Join-Path $Scripts "new-pair.ps1") -NoSpawn -Task "configured default review" -WorkerName "configured-default" -Mode review -CodexBin $fakeCodex -CodexModel "configured-default" -CodexReasoning auto | Select-Object -Last 1
+        $configuredDefault = $configuredDefaultJson | ConvertFrom-Json
+        $configuredDefaultTurn = Invoke-WorkerModeTurn -Pair $configuredDefault -FakeCodex $fakeCodex -CaptureDir (Join-Path $tempRoot "configured-default-capture") -Message "review with local Codex defaults"
+        $configuredDefault = $null
+        Assert-True (-not (@($configuredDefaultTurn.Args) -contains "-m")) "configured-default should omit the Codex model flag"
+        Assert-True (-not (($configuredDefaultTurn.Args -join "`n") -match "(?m)^model_reasoning_effort=")) "auto reasoning should omit the Codex reasoning override"
+
+        $failingCodex = New-FakeCodex -Directory (Join-Path $tempRoot "failing-fake") -ExitCode 7
+        $failingJson = & (Join-Path $Scripts "new-pair.ps1") -NoSpawn -Task "nonzero exit review" -WorkerName "failing-review" -Mode review -CodexBin $failingCodex -CodexModel "gpt-test-frontier" -CodexReasoning medium | Select-Object -Last 1
+        $failing = $failingJson | ConvertFrom-Json
+        $failingTurn = Invoke-WorkerModeTurn -Pair $failing -FakeCodex $failingCodex -CaptureDir (Join-Path $tempRoot "failing-capture") -Message "return partial output then fail" -ExpectError
+        $failing = $null
+        Assert-True ($failingTurn.Reply.error -match "exit=7") "nonzero Codex error should retain the exit code"
 
         $unsupportedPair = Invoke-ScriptExpectFailure -ScriptName "new-pair.ps1" -ScriptArgs @("-NoSpawn", "-Task", "unsupported reasoning", "-CodexBin", $fakeCodex, "-CodexModel", "gpt-test-fast", "-CodexReasoning", "medium")
         Assert-True ($unsupportedPair.ExitCode -ne 0) "discovered models should reject unsupported pair-level reasoning"
@@ -359,6 +382,8 @@ function Test-WorkerModes {
     } finally {
         if ($null -ne $review -and (Test-Path -LiteralPath $review.pair_dir)) { & (Join-Path $Scripts "purge-pair.ps1") -PairId $review.pair_id -Force | Out-Null }
         if ($null -ne $workhorse -and (Test-Path -LiteralPath $workhorse.pair_dir)) { & (Join-Path $Scripts "purge-pair.ps1") -PairId $workhorse.pair_id -Force | Out-Null }
+        if ($null -ne $configuredDefault -and (Test-Path -LiteralPath $configuredDefault.pair_dir)) { & (Join-Path $Scripts "purge-pair.ps1") -PairId $configuredDefault.pair_id -Force | Out-Null }
+        if ($null -ne $failing -and (Test-Path -LiteralPath $failing.pair_dir)) { & (Join-Path $Scripts "purge-pair.ps1") -PairId $failing.pair_id -Force | Out-Null }
         if ($null -ne $tampered -and (Test-Path -LiteralPath $tampered.pair_dir)) { & (Join-Path $Scripts "purge-pair.ps1") -PairId $tampered.pair_id -Force | Out-Null }
         if ($null -ne $legacy -and (Test-Path -LiteralPath $legacy.pair_dir)) { & (Join-Path $Scripts "purge-pair.ps1") -PairId $legacy.pair_id -Force | Out-Null }
         $env:CODEX_HOME = $oldCodexHome
@@ -417,6 +442,21 @@ function Test-CapabilityDiscovery {
         Assert-True ($hiddenFirstDefaults.defaults.model -eq "gpt-test-frontier") "defaults should never advertise a hidden model"
     } finally {
         Remove-Item -LiteralPath $hiddenFirstCachePath -Force -ErrorAction SilentlyContinue
+    }
+
+    $staleCachePath = Join-Path ([System.IO.Path]::GetTempPath()) ("co-review-stale-models-" + [System.Guid]::NewGuid().ToString("N") + ".json")
+    try {
+        $staleCache = Get-Content -LiteralPath $fixture -Raw | ConvertFrom-Json
+        $staleCache.fetched_at = "2000-01-01T00:00:00Z"
+        [System.IO.File]::WriteAllText($staleCachePath, ($staleCache | ConvertTo-Json -Depth 10), [System.Text.UTF8Encoding]::new($false))
+        $staleCapabilities = Get-CodexCapabilities -ModelsCachePath $staleCachePath -CodexBin "missing-codex.exe"
+        Assert-True ($staleCapabilities.source -eq "stale-models-cache" -and $staleCapabilities.cache_stale -eq $true) "stale caches should be reported explicitly"
+        Assert-True ($staleCapabilities.defaults.model -eq "configured-default") "stale caches should fall back to the Codex-configured default"
+        $staleAutoRejected = $false
+        try { Resolve-CodexSelection -Capabilities $staleCapabilities -Model auto -Reasoning auto | Out-Null } catch { $staleAutoRejected = $true }
+        Assert-True $staleAutoRejected "stale caches should not silently drive automatic model selection"
+    } finally {
+        Remove-Item -LiteralPath $staleCachePath -Force -ErrorAction SilentlyContinue
     }
 
     $jsonCapabilities = & (Join-Path $Scripts "get-capabilities.ps1") -ModelsCachePath $fixture -Json | ConvertFrom-Json
@@ -489,14 +529,24 @@ function Wait-ForListener {
 
 function Test-WorkerLifecycle {
     $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("co-review-lifecycle-" + [System.Guid]::NewGuid().ToString("N"))
-    $fakeCodex = New-FakeCodex -Directory (Join-Path $tempRoot "fake")
+    $fakeCodex = New-FakeCodex -Directory (Join-Path $tempRoot "fake codex")
     $codexHome = Join-Path $tempRoot "codex-home"
-    New-Item -ItemType Directory -Path $codexHome -Force | Out-Null
+    $projectWithSpaces = Join-Path $tempRoot "project with spaces"
+    New-Item -ItemType Directory -Path $codexHome,$projectWithSpaces -Force | Out-Null
     Copy-Item -LiteralPath (Join-Path $RepoRoot "tests\fixtures\models-cache.json") -Destination (Join-Path $codexHome "models_cache.json")
     $oldCodexHome = $env:CODEX_HOME
     $env:CODEX_HOME = $codexHome
     $workers = @()
+    $raceWorker = $null
+    $startupWorker = $null
     try {
+        . (Join-Path $Scripts "common.ps1")
+        Assert-True ((Resolve-CoReviewWindowStyle -WindowMode Foreground) -eq "Normal") "Foreground should map to the PowerShell Normal window style"
+        $startupJson = & (Join-Path $Scripts "new-worker.ps1") -Name "startup-timeout" -Mode review -Task "startup timeout" -ProjectCwd $projectWithSpaces -Model gpt-test-frontier -Reasoning medium -CodexBin $fakeCodex -DryRunListener -NoSpawn | Select-Object -Last 1
+        $startupWorker = $startupJson | ConvertFrom-Json
+        $startupRejected = $false
+        try { Start-CoReviewListener -PairId $startupWorker.worker_id -PairDir $startupWorker.pair_dir -WindowMode Hidden -StartupWaitSec 0 | Out-Null } catch { $startupRejected = $true }
+        Assert-True $startupRejected "listener startup should fail instead of returning a null validated PID"
         foreach ($name in @("review-security", "review-performance")) {
             $json = & (Join-Path $Scripts "new-worker.ps1") -Name $name -Mode review -Task "review task" -ProjectCwd $RepoRoot -Model gpt-test-frontier -Reasoning medium -CodexBin $fakeCodex -DryRunListener | Select-Object -Last 1
             $worker = $json | ConvertFrom-Json
@@ -507,15 +557,71 @@ function Test-WorkerLifecycle {
         Assert-True ($workers[0].worker_id -ne $workers[1].worker_id) "workers should have distinct ids"
         $reply = & (Join-Path $Scripts "ask-worker.ps1") -WorkerId $workers[0].worker_id -Message "hello worker" -TimeoutSec 20 -RawJson | Select-Object -Last 1 | ConvertFrom-Json
         Assert-True ($reply.content -match "hello worker") "worker ask should route through the existing queue"
+        $messageFile = Join-Path $tempRoot "message payload.txt"
+        [System.IO.File]::WriteAllText($messageFile, "hello from message file", [System.Text.UTF8Encoding]::new($false))
+        $fileReply = & (Join-Path $Scripts "ask-worker.ps1") -WorkerId $workers[0].worker_id -MessageFile $messageFile -TimeoutSec 20 -RawJson | Select-Object -Last 1 | ConvertFrom-Json
+        Assert-True ($fileReply.content -match "hello from message file") "ask-worker MessageFile should route file content"
+
+        $spaceJson = & (Join-Path $Scripts "new-worker.ps1") -Name "review-spaces" -Mode review -Task "path quoting" -ProjectCwd $projectWithSpaces -Model gpt-test-frontier -Reasoning medium -CodexBin $fakeCodex -DryRunListener | Select-Object -Last 1
+        $spaceWorker = $spaceJson | ConvertFrom-Json
+        $workers += $spaceWorker
+        Wait-ForListener -PairDir $spaceWorker.pair_dir
+        $spaceReply = & (Join-Path $Scripts "ask-worker.ps1") -WorkerId $spaceWorker.worker_id -Message "spaces work" -TimeoutSec 20 -RawJson | Select-Object -Last 1 | ConvertFrom-Json
+        Assert-True ($spaceReply.content -match "spaces work") "listener startup should quote paths containing spaces"
         $listed = @(& (Join-Path $Scripts "list-workers.ps1") -Json | ConvertFrom-Json)
         Assert-True (@($listed | Where-Object { $_.name -eq "review-security" -and $_.mode -eq "review" }).Count -eq 1) "list-workers should expose worker name and mode"
         $ensured = & (Join-Path $Scripts "ensure-worker.ps1") -WorkerId $workers[0].worker_id -Json | Select-Object -Last 1 | ConvertFrom-Json
         Assert-True ($ensured.status -eq "active") "ensure-worker should verify a live worker"
+
+        $recoveryWorker = $workers[1]
+        $recoveryReply = & (Join-Path $Scripts "ask-worker.ps1") -WorkerId $recoveryWorker.worker_id -Message "preserve this queue" -TimeoutSec 20 -RawJson | Select-Object -Last 1 | ConvertFrom-Json
+        Assert-True ($recoveryReply.content -match "preserve this queue") "recovery fixture should have a non-empty correlated queue"
+        $recoveryMetaBefore = Get-Content -LiteralPath (Join-Path $recoveryWorker.pair_dir "pair.json") -Raw | ConvertFrom-Json
+        $recoveryStatePath = Join-Path $recoveryWorker.pair_dir "state.json"
+        $recoveryState = Get-Content -LiteralPath $recoveryStatePath -Raw | ConvertFrom-Json
+        $recoveryState | Add-Member -NotePropertyName codex_session_id -NotePropertyValue "recovery-thread" -Force
+        [System.IO.File]::WriteAllText($recoveryStatePath, ($recoveryState | ConvertTo-Json -Depth 10), [System.Text.UTF8Encoding]::new($false))
+        $queueBefore = [System.IO.File]::ReadAllText((Join-Path $recoveryWorker.pair_dir "to-codex.jsonl"))
+        & (Join-Path $Scripts "end-worker.ps1") -WorkerId $recoveryWorker.worker_id | Out-Null
+        $restarted = & (Join-Path $Scripts "ensure-worker.ps1") -WorkerId $recoveryWorker.worker_id -Json | Select-Object -Last 1 | ConvertFrom-Json
+        Assert-True ($restarted.restarted -eq $true) "ensure-worker should restart a stopped listener"
+        $recoveryMetaAfter = Get-Content -LiteralPath (Join-Path $recoveryWorker.pair_dir "pair.json") -Raw | ConvertFrom-Json
+        foreach ($field in @("mode", "sandbox", "codex_model", "codex_reasoning", "codex_timeout_sec", "window_mode", "isolation", "dry_run_listener")) {
+            Assert-True ([string]$recoveryMetaAfter.$field -eq [string]$recoveryMetaBefore.$field) "recovery should preserve $field"
+        }
+        $recoveryStateAfter = Get-Content -LiteralPath $recoveryStatePath -Raw | ConvertFrom-Json
+        Assert-True ($recoveryStateAfter.codex_session_id -eq "recovery-thread") "recovery should preserve the Codex thread id"
+        Assert-True ([System.IO.File]::ReadAllText((Join-Path $recoveryWorker.pair_dir "to-codex.jsonl")) -eq $queueBefore) "recovery should preserve the request queue"
+
+        $raceJson = & (Join-Path $Scripts "new-worker.ps1") -Name "review-recovery-race" -Mode review -Task "recovery race" -ProjectCwd $projectWithSpaces -Model gpt-test-frontier -Reasoning medium -CodexBin $fakeCodex -DryRunListener -NoSpawn | Select-Object -Last 1
+        $raceWorker = $raceJson | ConvertFrom-Json
+        $workers += $raceWorker
+        $gatePath = Join-Path $tempRoot "start-race.gate"
+        $ensurePath = Join-Path $Scripts "ensure-worker.ps1"
+        $raceProcesses = @()
+        foreach ($index in 1..2) {
+            $outputPath = Join-Path $tempRoot "ensure-$index.out"
+            $command = "`$ErrorActionPreference='Stop'; while(-not (Test-Path -LiteralPath '$($gatePath.Replace("'", "''"))')){Start-Sleep -Milliseconds 10}; & '$($ensurePath.Replace("'", "''"))' -WorkerId '$($raceWorker.worker_id)' -Json | Set-Content -LiteralPath '$($outputPath.Replace("'", "''"))'"
+            $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($command))
+            $raceProcesses += Start-Process powershell.exe -ArgumentList @("-NoProfile", "-EncodedCommand", $encoded) -WindowStyle Hidden -PassThru
+        }
+        [System.IO.File]::WriteAllText($gatePath, "go", [System.Text.UTF8Encoding]::new($false))
+        foreach ($process in $raceProcesses) {
+            Assert-True ($process.WaitForExit(20000)) "concurrent ensure process should finish"
+            Assert-True ($process.ExitCode -eq 0) "concurrent ensure process should succeed"
+        }
+        Start-Sleep -Milliseconds 500
+        $listenerMatches = @(Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'codex-listener\.ps1' -and $_.CommandLine -match [regex]::Escape($raceWorker.worker_id) })
+        Assert-True ($listenerMatches.Count -eq 1) "concurrent recovery should spawn exactly one listener"
     } finally {
         foreach ($worker in $workers) {
             if (Test-Path -LiteralPath $worker.pair_dir) {
                 & (Join-Path $Scripts "end-worker.ps1") -WorkerId $worker.worker_id -Delete | Out-Null
             }
+        }
+        if ($null -ne $startupWorker -and (Test-Path -LiteralPath $startupWorker.pair_dir)) { & (Join-Path $Scripts "purge-worker.ps1") -WorkerId $startupWorker.worker_id -Force | Out-Null }
+        if ($null -ne $raceWorker) {
+            Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'codex-listener\.ps1' -and $_.CommandLine -match [regex]::Escape($raceWorker.worker_id) } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
         }
         $env:CODEX_HOME = $oldCodexHome
         Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
@@ -533,6 +639,7 @@ function Test-WriterLeases {
     $env:CODEX_HOME = $codexHome
     $first = $null
     $second = $null
+    $contenderDirs = @()
     try {
         $first = (& (Join-Path $Scripts "new-worker.ps1") -Name writer-one -Mode workhorse -Task "write one" -ProjectCwd $project -Isolation shared -Model gpt-test-frontier -Reasoning medium -CodexBin $fakeCodex -DryRunListener | Select-Object -Last 1) | ConvertFrom-Json
         Wait-ForListener -PairDir $first.pair_dir
@@ -549,6 +656,32 @@ function Test-WriterLeases {
         $staleLeasePath = Get-WriterLeasePath -WorkingDirectory $project
         $staleLease = @{ pair_id=$staleId; pair_dir=$staleDir; working_directory=(Get-CanonicalDirectory $project); created_at="2000-01-01T00:00:00Z" } | ConvertTo-Json -Compress
         [System.IO.File]::WriteAllText($staleLeasePath, $staleLease, [System.Text.UTF8Encoding]::new($false))
+
+        $leaseGate = Join-Path $tempRoot "lease-race.gate"
+        $commonPath = Join-Path $Scripts "common.ps1"
+        $contenders = @()
+        $resultPaths = @()
+        foreach ($index in 1..8) {
+            $contenderId = "pair-20000101-0000$index-c0de"
+            $contenderDir = Join-Path (Get-CoReviewRoot) $contenderId
+            New-Item -ItemType Directory -Path $contenderDir -Force | Out-Null
+            $contenderDirs += $contenderDir
+            $resultPath = Join-Path $tempRoot "lease-result-$index.json"
+            $resultPaths += $resultPath
+            $command = "`$ErrorActionPreference='Stop'; . '$($commonPath.Replace("'", "''"))'; while(-not (Test-Path -LiteralPath '$($leaseGate.Replace("'", "''"))')){Start-Sleep -Milliseconds 10}; Try-AcquireWriterLease -PairId '$contenderId' -PairDir '$($contenderDir.Replace("'", "''"))' -WorkingDirectory '$($project.Replace("'", "''"))' | ConvertTo-Json -Compress | Set-Content -LiteralPath '$($resultPath.Replace("'", "''"))'"
+            $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($command))
+            $contenders += Start-Process powershell.exe -ArgumentList @("-NoProfile", "-EncodedCommand", $encoded) -WindowStyle Hidden -PassThru
+        }
+        [System.IO.File]::WriteAllText($leaseGate, "go", [System.Text.UTF8Encoding]::new($false))
+        foreach ($process in $contenders) {
+            Assert-True ($process.WaitForExit(20000)) "lease contender should finish"
+            Assert-True ($process.ExitCode -eq 0) "lease contender should exit successfully"
+        }
+        $leaseResults = @($resultPaths | ForEach-Object { Get-Content -LiteralPath $_ -Raw | ConvertFrom-Json })
+        Assert-True (@($leaseResults | Where-Object { $_.acquired -eq $true }).Count -eq 1) "concurrent stale-lease reclamation should have exactly one winner"
+
+        Remove-Item -LiteralPath $staleLeasePath -Force -ErrorAction SilentlyContinue
+        [System.IO.File]::WriteAllText($staleLeasePath, $staleLease, [System.Text.UTF8Encoding]::new($false))
         $second = (& (Join-Path $Scripts "new-worker.ps1") -Name writer-two -Mode workhorse -Task "write two" -ProjectCwd $project -Isolation shared -Model gpt-test-frontier -Reasoning medium -CodexBin $fakeCodex -DryRunListener | Select-Object -Last 1) | ConvertFrom-Json
         Wait-ForListener -PairDir $second.pair_dir
         $reclaimedLease = Get-Content -LiteralPath $staleLeasePath -Raw | ConvertFrom-Json
@@ -557,6 +690,8 @@ function Test-WriterLeases {
     } finally {
         if ($null -ne $first -and (Test-Path -LiteralPath $first.pair_dir)) { & (Join-Path $Scripts "end-worker.ps1") -WorkerId $first.worker_id -Delete | Out-Null }
         if ($null -ne $second -and (Test-Path -LiteralPath $second.pair_dir)) { & (Join-Path $Scripts "end-worker.ps1") -WorkerId $second.worker_id -Delete | Out-Null }
+        foreach ($contenderDir in $contenderDirs) { if (Test-Path -LiteralPath $contenderDir) { Remove-Item -LiteralPath $contenderDir -Recurse -Force -ErrorAction SilentlyContinue } }
+        if ($null -ne $staleLeasePath -and (Test-Path -LiteralPath $staleLeasePath)) { Remove-Item -LiteralPath $staleLeasePath -Force -ErrorAction SilentlyContinue }
         $env:CODEX_HOME = $oldCodexHome
         Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
@@ -615,9 +750,72 @@ function Test-SkillCommandContracts {
         Assert-True ($skill -match [regex]::Escape($required)) "SKILL.md should document $required"
     }
     Assert-True ($skill -match "explicit.*user|user.*explicit") "explicit user model/reasoning choices should take precedence"
+    Assert-True ($skill -match "cache_stale" -and $skill -match "configured-default") "skill should teach Claude to avoid automatic selection from a stale cache"
     Assert-True ($skill -match "Claude.*sole orchestrator") "SKILL.md should keep Claude as sole orchestrator"
     Assert-True ($skill -notmatch "Spawn at most one pair per Claude conversation") "obsolete one-pair restriction should be removed"
     Assert-True ($skill -notmatch "Codex runs with `--sandbox read-only` by default") "obsolete review-only limitation should be removed"
+}
+
+function Test-BackwardCompatibility {
+    $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("co-review-compat-" + [System.Guid]::NewGuid().ToString("N"))
+    $fakeCodex = New-FakeCodex -Directory (Join-Path $tempRoot "fake")
+    $pairId = "pair-20000101-000000-cafe"
+    $pairDir = Join-Path (Join-Path $env:USERPROFILE ".cc-codex-pairs") $pairId
+    New-Item -ItemType Directory -Path $pairDir -Force | Out-Null
+    $legacyMeta = @{
+        pair_id=$pairId; created_at="2000-01-01T00:00:00Z"; project_cwd=$RepoRoot; task_hint="legacy"
+        codex_bin=$fakeCodex; codex_model="gpt-5.5"; codex_reasoning="medium"
+    } | ConvertTo-Json
+    [System.IO.File]::WriteAllText((Join-Path $pairDir "pair.json"), $legacyMeta, [System.Text.UTF8Encoding]::new($false))
+    [System.IO.File]::WriteAllText((Join-Path $pairDir "to-codex.jsonl"), "", [System.Text.UTF8Encoding]::new($false))
+    [System.IO.File]::WriteAllText((Join-Path $pairDir "to-claude.jsonl"), "", [System.Text.UTF8Encoding]::new($false))
+    $legacyState = @{ last_processed=$null; codex_session_id="legacy-thread"; msg_counter=0 } | ConvertTo-Json
+    [System.IO.File]::WriteAllText((Join-Path $pairDir "state.json"), $legacyState, [System.Text.UTF8Encoding]::new($false))
+    $legacyListenerPid = $null
+    try {
+        $listed = @(& (Join-Path $Scripts "list-workers.ps1") -Json | ConvertFrom-Json)
+        $legacy = $listed | Where-Object { $_.worker_id -eq $pairId } | Select-Object -First 1
+        Assert-True ($legacy.mode -eq "review" -and $legacy.sandbox -eq "read-only" -and $legacy.isolation -eq "shared") "schema-v1 pairs should normalize to shared read-only review"
+        $ensured = & (Join-Path $Scripts "ensure-worker.ps1") -WorkerId $pairId -Json | Select-Object -Last 1 | ConvertFrom-Json
+        Assert-True ($ensured.status -eq "active") "legacy pair should restart through worker recovery"
+        $legacyListenerPid = [int]$ensured.listener_pid
+        $legacyReply = & (Join-Path $Scripts "ask-worker.ps1") -WorkerId $pairId -Message "legacy ask" -TimeoutSec 20 -RawJson | Select-Object -Last 1 | ConvertFrom-Json
+        Assert-True ($legacyReply.content -eq "fake codex reply") "legacy pairs should support correlated ask-worker replies"
+        $stateAfter = Get-Content -LiteralPath (Join-Path $pairDir "state.json") -Raw | ConvertFrom-Json
+        Assert-True ($stateAfter.codex_session_id -eq "legacy-thread") "recovery should preserve an existing Codex thread id"
+    } finally {
+        try {
+            if (Test-Path -LiteralPath $pairDir) { & (Join-Path $Scripts "end-worker.ps1") -WorkerId $pairId -Delete | Out-Null }
+        } finally {
+            if ($null -ne $legacyListenerPid) {
+                $listenerStillAlive = $null -ne (Get-Process -Id $legacyListenerPid -ErrorAction SilentlyContinue)
+                if ($listenerStillAlive) { Stop-Process -Id $legacyListenerPid -Force -ErrorAction SilentlyContinue }
+                Assert-True (-not $listenerStillAlive) "end-worker should not leave an orphaned listener after deleting state"
+            }
+        }
+    }
+
+    $repo = Join-Path ([System.IO.Path]::GetTempPath()) ("co-review-dirty-cleanup-" + [System.Guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $repo -Force | Out-Null
+    & git -C $repo init | Out-Null
+    & git -C $repo config user.email "test@example.com"
+    & git -C $repo config user.name "Co Review Test"
+    Set-Content -LiteralPath (Join-Path $repo "tracked.txt") -Value "base" -Encoding ASCII
+    & git -C $repo add tracked.txt
+    & git -C $repo commit -m "base" | Out-Null
+    $worker = $null
+    try {
+        $worker = (& (Join-Path $Scripts "new-pair.ps1") -WorkerName cleanup -Mode workhorse -Task cleanup -ProjectCwd $repo -Isolation worktree -CodexBin $fakeCodex -NoSpawn | Select-Object -Last 1) | ConvertFrom-Json
+        Set-Content -LiteralPath (Join-Path $worker.project_cwd "dirty.txt") -Value "keep" -Encoding ASCII
+        $refused = Invoke-ScriptExpectFailure -ScriptName "end-worker.ps1" -ScriptArgs @("-WorkerId",$worker.worker_id,"-RemoveWorktree","-ConfirmRemoveWorktree")
+        Assert-True ($refused.ExitCode -ne 0 -and $refused.Output -match "uncommitted changes") "dirty managed worktree removal should be refused"
+        Assert-True (Test-Path -LiteralPath (Join-Path $worker.project_cwd "dirty.txt")) "refused cleanup should preserve isolated changes"
+    } finally {
+        if ($null -ne $worker -and (Test-Path -LiteralPath $worker.pair_dir)) { & (Join-Path $Scripts "purge-worker.ps1") -WorkerId $worker.worker_id -Force | Out-Null }
+        if ($null -ne $worker -and (Test-Path -LiteralPath $worker.project_cwd)) { & git -C $repo worktree remove --force $worker.project_cwd 2>$null | Out-Null }
+        Remove-Item -LiteralPath $repo -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 $TestGroups = [ordered]@{
@@ -633,6 +831,7 @@ $TestGroups = [ordered]@{
     WriterLeases = { Test-WriterLeases }
     WorktreeIsolation = { Test-WorktreeIsolation }
     SkillCommandContracts = { Test-SkillCommandContracts }
+    BackwardCompatibility = { Test-BackwardCompatibility }
 }
 
 if ($Only) {

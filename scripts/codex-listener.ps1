@@ -18,7 +18,6 @@ $ErrorActionPreference = "Continue"
 $pairDir = Get-PairDir -PairId $PairId
 if (-not (Test-Path $pairDir)) {
     Write-Host "[co-review] FATAL: pair dir not found: $pairDir" -ForegroundColor Red
-    Read-Host "Press Enter to close"
     exit 1
 }
 
@@ -39,24 +38,18 @@ trap {
     continue
 }
 
-# Load metadata
-$meta = Get-Content $pairMeta -Raw | ConvertFrom-Json
+# Load metadata through the shared schema-v1 compatibility boundary.
+$meta = Get-NormalizedPairMetadata -PairDir $pairDir
 if ([string]::IsNullOrWhiteSpace($CodexBin)) { $CodexBin = $meta.codex_bin }
 if ([string]::IsNullOrWhiteSpace($CodexModel)) { $CodexModel = [string]$meta.codex_model }
 if ([string]::IsNullOrWhiteSpace($CodexReasoning)) { $CodexReasoning = [string]$meta.codex_reasoning }
 if ($CodexTimeoutSec -le 0) {
     $CodexTimeoutSec = if ($meta.codex_timeout_sec -gt 0) { [int]$meta.codex_timeout_sec } else { 1800 }
 }
-$schemaVersion = if ($meta.schema_version -ge 2) { [int]$meta.schema_version } else { 1 }
-if ($schemaVersion -eq 1) {
-    $workerMode = "review"
-    $workerSandbox = "read-only"
-    $workerIsolation = "shared"
-} else {
-    $workerMode = [string]$meta.mode
-    $workerSandbox = [string]$meta.sandbox
-    $workerIsolation = [string]$meta.isolation
-}
+$schemaVersion = [int]$meta.schema_version
+$workerMode = [string]$meta.mode
+$workerSandbox = [string]$meta.sandbox
+$workerIsolation = [string]$meta.isolation
 
 $metadataError = ""
 if ($workerMode -notin @("review", "workhorse")) {
@@ -72,9 +65,6 @@ if ($metadataError) {
     exit 1
 }
 
-$meta | Add-Member -NotePropertyName mode -NotePropertyValue $workerMode -Force
-$meta | Add-Member -NotePropertyName sandbox -NotePropertyValue $workerSandbox -Force
-$meta | Add-Member -NotePropertyName isolation -NotePropertyValue $workerIsolation -Force
 $workerProfile = [string]$meta.profile
 $workerAddDirs = @($meta.add_dirs | ForEach-Object { [string]$_ })
 $workerSearch = ($meta.search_enabled -eq $true)
@@ -84,7 +74,6 @@ try {
     Assert-SafeCodexConfigOverrides -Overrides $workerConfigOverrides
 } catch {
     Write-Host "[co-review] FATAL: $($_.Exception.Message)" -ForegroundColor Red
-    Read-Host "Press Enter to close"
     exit 1
 }
 
@@ -233,9 +222,8 @@ function Invoke-Codex {
 
         # All global `exec` options must come BEFORE the `resume` subcommand;
         # clap rejects `--sandbox` etc. after the subcommand name.
-        # `-m` pins the model so behavior is consistent across machines regardless
-        # of each user's ~/.codex/config.toml. `-c model_reasoning_effort=...`
-        # overrides reasoning depth the same way.
+        # Explicit selections pin model/reasoning. Sentinel values omit those
+        # flags so Codex can honor the user's own ~/.codex/config.toml defaults.
         $codexArgs = @("-a", "never")
         if ($Search) { $codexArgs += "--search" }
         foreach ($dir in $validatedAddDirs) { $codexArgs += @("--add-dir", $dir) }
@@ -246,11 +234,13 @@ function Invoke-Codex {
             "--sandbox", $Sandbox
         )
         if (-not [string]::IsNullOrWhiteSpace($Profile)) { $codexArgs += @("-p", $Profile) }
-        $codexArgs += @(
-            "-m", $Model,
-            "-c", "model_reasoning_effort=$Reasoning",
-            "-c", "features.multi_agent=false"
-        )
+        if (-not [string]::IsNullOrWhiteSpace($Model) -and $Model -notin @("auto", "configured-default")) {
+            $codexArgs += @("-m", $Model)
+        }
+        if (-not [string]::IsNullOrWhiteSpace($Reasoning) -and $Reasoning -ne "auto") {
+            $codexArgs += @("-c", "model_reasoning_effort=$Reasoning")
+        }
+        $codexArgs += @("-c", "features.multi_agent=false")
         foreach ($override in $ConfigOverrides) { $codexArgs += @("-c", $override) }
         $codexArgs += @(
             "-C", $Cwd,
@@ -445,8 +435,13 @@ while ($true) {
                 $envelope = New-CodexTaskEnvelope -Meta $meta -Task ([string]$msg.content)
                 $result = Invoke-Codex -Prompt $envelope -SessionId $sid -Cwd $workDir -Model $effectiveModel -Reasoning $effectiveReasoning -Sandbox $workerSandbox -TimeoutSec $effectiveTimeout -Profile $workerProfile -AddDir $workerAddDirs -Search $workerSearch -ConfigOverrides $workerConfigOverrides
 
-                if ($result.ExitCode -ne 0 -and [string]::IsNullOrWhiteSpace($result.Reply)) {
-                    $errText = "codex exec exit=$($result.ExitCode). stderr:`n$($result.Stderr)"
+                if ($result.ExitCode -ne 0) {
+                    $stderrText = [string]$result.Stderr
+                    if ($stderrText.Length -gt 8000) { $stderrText = $stderrText.Substring(0, 8000) + "`n[stderr truncated]" }
+                    $partialReply = [string]$result.Reply
+                    if ($partialReply.Length -gt 4000) { $partialReply = $partialReply.Substring(0, 4000) + "`n[partial output truncated]" }
+                    $errText = "codex exec exit=$($result.ExitCode). stderr:`n$stderrText"
+                    if (-not [string]::IsNullOrWhiteSpace($partialReply)) { $errText += "`npartial output:`n$partialReply" }
                     Write-Host "    ERROR: $errText" -ForegroundColor Red
                     Write-Log "ERROR on $($msg.id): $errText"
                     $rid = Append-Reply -InReplyTo $msg.id -Content "" -ErrMsg $errText

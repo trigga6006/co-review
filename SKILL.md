@@ -67,6 +67,8 @@ $caps.models | Select-Object slug, display_name, default_reasoning_level, suppor
 
 Do not rely on a frozen model list. Choose only combinations advertised by the installed Codex cache. Hidden/internal models appear only with `-IncludeHidden`.
 
+If `$caps.cache_stale` is true, do not use that cache for automatic selection. Use `configured-default` with `auto` reasoning, or honor an explicit user-provided model/reasoning choice.
+
 Selection guidance when the user did not choose:
 
 - Hard architecture, security, correctness, debugging, or ambiguous review: highest-capability visible model and higher reasoning.

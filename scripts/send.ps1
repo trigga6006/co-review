@@ -1,11 +1,11 @@
 # co-review: send.ps1
 # Append a message from Claude into to-codex.jsonl. Prints the new message ID.
-[CmdletBinding()]
+[CmdletBinding(DefaultParameterSetName="Inline")]
 param(
     [Parameter(Mandatory=$true)][string]$PairId,
-    [Parameter(Mandatory=$true)][string]$Message,
+    [Parameter(Mandatory=$true, ParameterSetName="Inline")][string]$Message,
     [string]$Type = "request",
-    [string]$MessageFile = "",
+    [Parameter(Mandatory=$true, ParameterSetName="File")][string]$MessageFile,
     [string]$Model = "",
     # Optional per-turn overrides. Empty strings mean "use pair default".
     [string]$Reasoning = "",
