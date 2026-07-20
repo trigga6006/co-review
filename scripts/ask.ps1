@@ -12,7 +12,10 @@ param(
     # Optional per-turn overrides. TurnTimeoutSec is separate from the wait timeout above.
     [string]$Reasoning = "",
     [int]$TurnTimeoutSec = 0,
-    [switch]$RawJson
+    [switch]$RawJson,
+    [switch]$Queue,
+    [switch]$LeaveRunning,
+    [switch]$AllowErrorReply
 )
 
 $ErrorActionPreference = "Stop"
@@ -23,9 +26,9 @@ Assert-ValidPairId -PairId $PairId
 
 # Invoke send.ps1 in-process via the call operator (no subshell, no exec-policy flag).
 if ($PSCmdlet.ParameterSetName -eq "File") {
-    $msgId = (& $sendPath -PairId $PairId -Type $Type -MessageFile $MessageFile -Model $Model -Reasoning $Reasoning -TurnTimeoutSec $TurnTimeoutSec | Select-Object -Last 1).ToString().Trim()
+    $msgId = (& $sendPath -PairId $PairId -Type $Type -MessageFile $MessageFile -Model $Model -Reasoning $Reasoning -TurnTimeoutSec $TurnTimeoutSec -Queue:$Queue | Select-Object -Last 1).ToString().Trim()
 } else {
-    $msgId = (& $sendPath -PairId $PairId -Type $Type -Message $Message -Model $Model -Reasoning $Reasoning -TurnTimeoutSec $TurnTimeoutSec | Select-Object -Last 1).ToString().Trim()
+    $msgId = (& $sendPath -PairId $PairId -Type $Type -Message $Message -Model $Model -Reasoning $Reasoning -TurnTimeoutSec $TurnTimeoutSec -Queue:$Queue | Select-Object -Last 1).ToString().Trim()
 }
 if ([string]::IsNullOrWhiteSpace($msgId)) {
     Write-Error "send.ps1 did not return a message id"
@@ -41,24 +44,34 @@ $toClaude = Join-Path -Path $pairDir -ChildPath "to-claude.jsonl"
 
 $deadline = (Get-Date).AddSeconds($TimeoutSec)
 $reply = $null
+$seenProgress = @{}
 
 while ($true) {
     if (Test-Path $toClaude) {
         $lines = @(Get-Content $toClaude -Encoding UTF8 -ErrorAction SilentlyContinue | Where-Object { $_ -and $_.Trim() -ne "" })
         foreach ($line in $lines) {
             try { $obj = $line | ConvertFrom-Json } catch { continue }
-            if ($obj.in_reply_to -eq $msgId) { $reply = $obj; break }
+            if ($obj.in_reply_to -ne $msgId) { continue }
+            if ($obj.type -eq "progress" -and -not $seenProgress.ContainsKey([string]$obj.id)) {
+                $seenProgress[[string]$obj.id] = $true
+                Write-Host "[co-review] Codex progress: $($obj.content)" -ForegroundColor DarkCyan
+            } elseif ($obj.type -in @("response", "error")) { $reply = $obj; break }
         }
         if ($reply) { break }
     }
     if ((Get-Date) -ge $deadline) {
-        Write-Error "Timeout after ${TimeoutSec}s waiting for reply to $msgId"
-        exit 2
+        if (-not $LeaveRunning) {
+            try { & (Join-Path $scriptDir "cancel-worker.ps1") -WorkerId $PairId -MessageId $msgId -Json | Out-Null } catch {}
+        }
+        $suffix = if ($LeaveRunning) { " The Codex turn was left running." } else { " The Codex turn was cancelled to prevent hidden background work." }
+        throw "Timeout after ${TimeoutSec}s waiting for reply to $msgId.$suffix"
     }
     Start-Sleep -Seconds $PollIntervalSec
 }
 
-if ($RawJson) {
+if ($reply.error -and -not $AllowErrorReply) {
+    throw "Codex turn $msgId failed: $($reply.error)"
+} elseif ($RawJson) {
     Write-Output ($reply | ConvertTo-Json -Compress -Depth 10)
 } else {
     Write-Host ""

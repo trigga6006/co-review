@@ -15,12 +15,24 @@ Invoke-WithCoReviewMutex -Name $mutexName -ScriptBlock {
     $meta = Get-NormalizedPairMetadata -PairDir $pairDir
 
     [System.IO.File]::WriteAllText((Join-Path $pairDir "shutdown"), "", [System.Text.UTF8Encoding]::new($false))
+    $activePath = Join-Path $pairDir "active-turn.json"
+    if (Test-Path -LiteralPath $activePath -PathType Leaf) {
+        try {
+            $active = Get-Content -LiteralPath $activePath -Raw | ConvertFrom-Json
+            [int]$activePid = 0
+            if ([int]::TryParse([string]$active.process_pid, [ref]$activePid) -and $activePid -gt 0) {
+                Stop-CoReviewProcessTree -ProcessId $activePid
+            }
+        } catch {
+            Write-Warning "Could not stop active Codex turn cleanly: $($_.Exception.Message)"
+        }
+    }
     $listenerPid = $null
     $deadline = (Get-Date).AddSeconds(5)
     while ((Get-Date) -lt $deadline -and (Test-CoReviewListenerAlive -PairDir $pairDir -ListenerPid ([ref]$listenerPid))) { Start-Sleep -Milliseconds 200 }
     $listenerStillAlive = Test-CoReviewListenerAlive -PairDir $pairDir -ListenerPid ([ref]$listenerPid)
     if ($listenerStillAlive -and $null -ne $listenerPid) { Stop-CoReviewProcessTree -ProcessId $listenerPid }
-    if ([string]$meta.mode -eq "workhorse") { Release-WriterLease -PairId $PairId -WorkingDirectory ([string]$meta.project_cwd) }
+    if ([string]$meta.mode -in @("workhorse", "imagegen")) { Release-WriterLease -PairId $PairId -WorkingDirectory ([string]$meta.project_cwd) }
 
     if ($RemoveWorktree -and [string]$meta.isolation -eq "worktree" -and -not [string]::IsNullOrWhiteSpace([string]$meta.worktree_path)) {
         if (Test-CoReviewWorktreeHasChanges -Path ([string]$meta.worktree_path)) { throw "Managed worktree has uncommitted changes; refusing removal" }

@@ -10,6 +10,7 @@ param(
     # Optional per-turn overrides. Empty strings mean "use pair default".
     [string]$Reasoning = "",
     [int]$TurnTimeoutSec = 0,
+    [switch]$Queue,
     [switch]$NoEnsure
 )
 
@@ -57,6 +58,27 @@ try {
     if (-not $locked) {
         Write-Error "Timed out waiting for send lock for $PairId"
         exit 2
+    }
+
+    if (-not $Queue) {
+        $repliedTo = @{}
+        $toClaude = Join-Path -Path $pairDir -ChildPath "to-claude.jsonl"
+        if (Test-Path -LiteralPath $toClaude -PathType Leaf) {
+            foreach ($line in @(Get-Content -LiteralPath $toClaude -Encoding UTF8 -ErrorAction SilentlyContinue)) {
+                try { $replyObj = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+                if ([string]$replyObj.type -in @("response", "error") -and -not [string]::IsNullOrWhiteSpace([string]$replyObj.in_reply_to)) { $repliedTo[[string]$replyObj.in_reply_to] = $true }
+            }
+        }
+        $pending = @()
+        if (Test-Path -LiteralPath $toCodex -PathType Leaf) {
+            foreach ($line in @(Get-Content -LiteralPath $toCodex -Encoding UTF8 -ErrorAction SilentlyContinue)) {
+                try { $requestObj = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+                if (-not $repliedTo.ContainsKey([string]$requestObj.id)) { $pending += [string]$requestObj.id }
+            }
+        }
+        if ($pending.Count -gt 0) {
+            throw "Worker $PairId is busy or already queued ($($pending -join ', ')). Wait/cancel it, or pass -Queue to enqueue intentionally."
+        }
     }
 
     # Derive next id from existing line count under lock.

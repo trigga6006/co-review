@@ -1,35 +1,48 @@
 ---
 name: co-review
-description: Use when Claude should ask Codex for a review or second opinion, delegate implementation to Codex as a workhorse or sub-agent, run multiple Codex workers, or honor a requested Codex model, reasoning level, sandbox, or execution mode.
+description: Use when Claude should get a bounded cross-family review or second opinion from Codex, when the user explicitly asks Codex to implement a task as a workhorse, or when the user requests raster image generation/editing that Codex can perform with its imagegen skill. Supports dedicated review, workhorse, and imagegen modes; live model/reasoning selection; persistent leaf workers; safe writer isolation; cancellation; and parallel workers without making Codex the default critical path.
 ---
 
-# Codex workers for Claude Code
+# Co-review: fast cross-family checks for Claude Code
 
-Claude is the sole orchestrator. Codex processes are leaf workers: Claude chooses their assignments and configuration, reviews their results, and communicates with the user. A Codex worker must not spawn, delegate to, or coordinate other agents.
+Claude is the sole orchestrator. Codex processes are leaf workers and must not spawn or coordinate other agents.
 
-Workers run through a hidden PowerShell listener that maintains a persistent Codex thread and file queue. The listener is a background process host, not the interactive Codex TUI.
+## Prime directive
 
-## Decision table
+Optimize for finishing the user's task, not maximizing Codex involvement.
 
-| User intent | Mode | Sandbox | Isolation |
+When the user asks to "use co-review," "ask GPT," or get a cross-family check on an implementation, Claude normally owns the implementation and asks Codex for one bounded review. Do not hand the entire task to a workhorse merely because this skill was invoked.
+
+Use a Codex workhorse only when the user explicitly asks Codex/GPT to implement, delegate, or act as a workhorse. Never turn an ordinary task into a serial plan, implementation, review, fix, and re-review chain.
+
+Image generation is a separate first-class path, not generic workhorse delegation. When the user requests a raster image, select `imagegen` even if they do not mention Codex or use the word "workhorse," unless they explicitly choose another method. Codex can generate images through its installed `$imagegen` skill and image-generation tool. Do not claim otherwise based on stale product knowledge, and do not route an image request through `workhorse` merely because it creates a file.
+
+## Default latency budget
+
+| Class | Typical scope | Reasoning | Codex turn timeout |
 |---|---|---|---|
-| Review, critique, challenge, second opinion | `review` | `read-only` | `shared` |
-| Implement, fix, test, workhorse, sub-agent | `workhorse` | `workspace-write` | `auto` |
-| Several reviews in parallel | one `review` worker per concern | `read-only` | `shared` |
-| Several writers in parallel | one `workhorse` per task | `workspace-write` | managed Git worktrees |
+| Fast | focused diff, mechanical check, small second opinion | model default or `low` | 120 seconds |
+| Standard | normal implementation review, bounded debugging | `low` or `medium` | 300 seconds |
+| Image | raster image generation or editing with `$imagegen` | model default or `low` | 600 seconds |
+| Deep | architecture/security investigation with concrete need | `high` | 600 seconds |
 
-Explicit user choices for mode, model, reasoning, isolation, search, or visibility take precedence. Never silently widen permissions.
+Use Fast unless the scope clearly requires Standard. Use Deep only when the user explicitly requests depth or Claude can name a correctness/security question that lower reasoning is unlikely to resolve. Never select `xhigh`, `max`, or `ultra` automatically. "Strongest model" selects model capability; it does not imply high reasoning.
 
-## Non-negotiable guardrails
+New workers default to a 300-second process timeout, two total turns, and at most two meaningful progress updates per turn. A second turn is reserved for one targeted clarification or one verified blocker. Start a fresh worker only when the responsibility genuinely changes. Do not repeatedly ask Codex to re-review its own work.
 
-- Keep Claude as the sole orchestrator; each Codex process is a leaf worker.
-- Review workers are always read-only.
-- A shared-checkout workhorse holds a writer lease. Claude must not edit that checkout until the worker finishes.
-- Parallel workhorses use separate Git worktrees. The system never auto-merges their work.
-- Automatic parallel isolation refuses a dirty source repository because uncommitted changes are absent from a new worktree. Serialize instead, or use `-AllowDirtyBase` only when the user accepts committed-HEAD-only context.
-- Use `danger-full-access` only when the user explicitly requests it, and pass `-ConfirmDangerFullAccess`.
-- Do not ask workers to spawn agents. The listener also forces Codex `features.multi_agent=false`.
-- Claude reviews worker changes and verification evidence before claiming completion.
+## Choose the mode
+
+| User intent | Mode | Sandbox | Default behavior |
+|---|---|---|---|
+| Review, critique, second opinion, cross-family check | `review` | `read-only` | One bounded turn; Claude continues useful independent work when possible |
+| Explicit Codex implementation/delegation | `workhorse` | `workspace-write` | One bounded implementation turn, optional targeted follow-up |
+| Generate or edit a raster image | `imagegen` | `workspace-write` | Invoke `$imagegen` and the image-generation tool; return the generated file path |
+| Several independent reviews explicitly requested | one reviewer per concern | `read-only` | Dispatch concurrently |
+| Several writable workers explicitly requested | one worker per task | `workspace-write` | Managed Git worktrees; never auto-merge |
+
+Explicit user choices for model, reasoning, mode, isolation, search, sandbox, or visibility always win. Never silently widen permissions.
+
+Select `imagegen` for new raster artwork, illustrations, concept images, photo-style assets, and edits to existing images. Keep diagrams, charts, SVGs, and code-rendered graphics in the normal Claude workflow unless the user explicitly wants generative image output. Image generation benefits from tool time, not extreme reasoning; normally use the visible model default with `low` or its advertised default reasoning and a 600-second turn timeout.
 
 ## Script root
 
@@ -39,185 +52,176 @@ Use PowerShell and the call operator. Never add `-ExecutionPolicy Bypass`.
 $coReview = "$env:USERPROFILE\.claude\skills\co-review\scripts"
 ```
 
-If the skill is installed elsewhere, resolve the current skill directory and use its `scripts` child.
+If installed elsewhere, resolve this skill directory and use its `scripts` child.
 
-## Orchestration workflow
+## Workflow
 
-### 1. Honor the user's configuration
+### 1. Define one bounded question
 
-Extract any explicit request for:
+Send the smallest task that provides independent value. Include exact files/diff/scope and a short output contract. Avoid open-ended prompts such as "be exhaustive," "investigate everything," or "keep working until perfect" unless the user explicitly asks for that depth.
 
-- mode: review or workhorse
-- model slug
-- reasoning level
-- parallel or serial execution
-- search, profile, additional writable directories, or advanced config
-- hidden, minimized, or foreground listener
+For a normal review, request a verdict and at most three evidence-backed findings. For implementation, request the bounded change, focused verification, changed files, and blockers.
 
-An explicit choice wins over heuristics.
+For `imagegen`, include the desired subject, composition, style, aspect ratio or dimensions when known, exact output directory/name, and every source-image path needed for an edit. Tell Codex to use `$imagegen`; never ask it only to draft a prompt. If a required source image is unavailable, obtain a usable local path before dispatching rather than falling back to a workhorse.
 
-### 2. Discover live options
+### 2. Discover live capabilities
 
-Run this when capabilities are not already fresh in the current conversation:
+Run only when capabilities are not fresh in the conversation:
 
 ```powershell
 $caps = & "$coReview\get-capabilities.ps1" -Json | ConvertFrom-Json
-$caps.models | Select-Object slug, display_name, default_reasoning_level, supported_reasoning_levels, additional_speed_tiers
+$caps.models | Select-Object slug, display_name, default_reasoning_level, supported_reasoning_levels
 ```
 
-Do not rely on a frozen model list. Choose only combinations advertised by the installed Codex cache. Hidden/internal models appear only with `-IncludeHidden`.
+Do not use a frozen model list. If `cache_stale` is true, use `configured-default` with `auto` reasoning or honor an explicit user selection. Otherwise choose the highest-priority visible model with its advertised default reasoning. Prefer a smaller visible model only for clearly mechanical work.
 
-If `$caps.cache_stale` is true, do not use that cache for automatic selection. Use `configured-default` with `auto` reasoning, or honor an explicit user-provided model/reasoning choice.
-
-Selection guidance when the user did not choose:
-
-- Hard architecture, security, correctness, debugging, or ambiguous review: highest-capability visible model and higher reasoning.
-- Ordinary implementation/review: highest-priority visible model and its advertised default reasoning.
-- Small, mechanical, low-risk task: a visible smaller/faster model.
-- If live models are unavailable, use `configured-default` or an explicit known model. Unknown slugs require `-AllowUnknownModel` on `new-worker.ps1`.
-
-### 3. Reuse or create a matching worker
-
-List current workers:
+### 3. Inspect status before reuse
 
 ```powershell
-$workers = @(& "$coReview\list-workers.ps1" -Json | ConvertFrom-Json)
+$workers = & "$coReview\list-workers.ps1" -Json | ConvertFrom-Json
 ```
 
-Reuse an idle worker only when its project, mode, sandbox, and responsibility match. A persistent worker retains its Codex thread. Start a new named worker when the role or capability boundary differs.
+Reuse only an `idle` worker whose project, mode, sandbox, and narrow responsibility match. Never send to a `busy` worker. `queue_depth`, `active_message_id`, and `active_elapsed_sec` show hidden work. Sending refuses an occupied worker unless `-Queue` is explicitly supplied; intentional queueing should be rare.
 
-### 4. Dispatch and wait or continue in parallel
+### 4. Dispatch without creating dead time
 
-Use `ask-worker.ps1` for the common synchronous path. Use `send-worker.ps1` plus `recv-worker.ps1` when Claude has useful independent work or several workers are running.
+Prefer asynchronous dispatch when Claude has independent inspection, implementation, tests, or documentation work:
 
-### 5. Review and integrate
+```powershell
+$messageId = & "$coReview\send-worker.ps1" -WorkerId $worker.worker_id `
+  -Message "Review only the current diff. Return a verdict and at most 3 correctness findings with file references." `
+  -TurnTimeoutSec 120
 
-For workhorses, inspect the diff and reported test evidence. For managed worktrees, review the dedicated branch/commit and deliberately cherry-pick or merge it. Never auto-integrate.
+# Claude does useful independent work, then checks for progress without waiting:
+$updates = & "$coReview\recv-worker.ps1" -WorkerId $worker.worker_id `
+  -InReplyTo $messageId -IncludeProgress
 
-### 6. Stop workers
+# Wait for the final response only when it gates completion:
+& "$coReview\recv-worker.ps1" -WorkerId $worker.worker_id `
+  -InReplyTo $messageId -Wait -UntilFinal -TimeoutSec 150
+```
 
-Stop workers when the task finishes or the conversation pivots. Preserve isolated worktrees unless their changes are safely integrated or the user confirms removal.
+Use the synchronous path only when the reply genuinely gates the next action. Keep the wait timeout slightly longer than the Codex turn timeout:
+
+```powershell
+& "$coReview\ask-worker.ps1" -WorkerId $worker.worker_id `
+  -Message "Answer the single bounded question..." `
+  -TurnTimeoutSec 300 -TimeoutSec 330
+```
+
+By default, a synchronous wait timeout cancels the Codex turn so it cannot keep consuming time invisibly. Use `-LeaveRunning` only when the user wants background continuation.
+
+Progress messages contain only explicitly marked, high-confidence findings; they do not make a worker idle or complete a turn. Poll them at natural checkpoints rather than continuously. Use the last returned message `id` with `-Since` to avoid rereading updates.
+
+### 5. Decide once, then stop
+
+Claude evaluates the result, integrates useful findings, and finishes. One targeted follow-up is allowed only for an unresolved blocker or ambiguous correctness/security evidence. Do not ask broad follow-ups, request ceremonial re-reviews, or wait for Codex after Claude already has enough evidence to proceed.
+
+Stop workers when the task finishes or pivots:
+
+```powershell
+& "$coReview\end-worker.ps1" -WorkerId $worker.worker_id
+```
 
 ## Complete examples
 
-### Review with the strongest available model
+### Normal cross-family implementation review
+
+Claude implements and runs focused tests first, then creates one reviewer:
 
 ```powershell
 $caps = & "$coReview\get-capabilities.ps1" -Json | ConvertFrom-Json
 $model = $caps.models[0].slug
-$reasoning = if (@($caps.models[0].supported_reasoning_levels.effort) -contains "high") { "high" } else { $caps.models[0].default_reasoning_level }
+$reasoning = $caps.models[0].default_reasoning_level
 
 $reviewer = & "$coReview\new-worker.ps1" `
-  -Name "auth-review" `
-  -Mode review `
-  -Task "Review the current authentication changes for correctness and security" `
-  -ProjectCwd (Get-Location).Path `
-  -Model $model `
-  -Reasoning $reasoning | Select-Object -Last 1 | ConvertFrom-Json
+  -Name "focused-review" -Mode review `
+  -Task "Independent correctness review of the current bounded change" `
+  -ProjectCwd (Get-Location).Path -Model $model -Reasoning $reasoning `
+  -TimeoutSec 120 -MaxTurns 1 | Select-Object -Last 1 | ConvertFrom-Json
 
-& "$coReview\ask-worker.ps1" `
-  -WorkerId $reviewer.worker_id `
-  -Message "Inspect the current diff. Return a verdict and prioritized evidence-backed findings with file references." `
-  -TimeoutSec 900
+& "$coReview\ask-worker.ps1" -WorkerId $reviewer.worker_id `
+  -Message "Inspect only the current diff. Return a verdict and at most 3 actionable correctness findings with file references. Do not summarize unchanged code." `
+  -TurnTimeoutSec 120 -TimeoutSec 150
 ```
 
-### Workhorse sub-agent
+### Explicit workhorse delegation
 
 ```powershell
 $worker = & "$coReview\new-worker.ps1" `
-  -Name "parser-implementation" `
-  -Mode workhorse `
-  -Task "Implement the parser change and run its focused tests" `
-  -ProjectCwd (Get-Location).Path `
-  -Model $model `
-  -Reasoning medium `
-  -Isolation auto | Select-Object -Last 1 | ConvertFrom-Json
+  -Name "parser-change" -Mode workhorse `
+  -Task "Implement only the parser change and run focused tests" `
+  -ProjectCwd (Get-Location).Path -Model $model -Reasoning low `
+  -Isolation auto -TimeoutSec 300 -MaxTurns 2 | Select-Object -Last 1 | ConvertFrom-Json
 
-& "$coReview\ask-worker.ps1" `
-  -WorkerId $worker.worker_id `
-  -Message "Implement the bounded parser task from the repository context. Run appropriate tests and report outcome, changed files, commands/results, and remaining risks." `
-  -TimeoutSec 1800
+& "$coReview\ask-worker.ps1" -WorkerId $worker.worker_id `
+  -Message "Implement the bounded parser change. Run focused tests. Report outcome, changed files, test results, and blockers; do not broaden scope." `
+  -TurnTimeoutSec 300 -TimeoutSec 330
 ```
 
-While this shared workhorse owns the checkout, Claude pauses its own edits. After the reply, Claude inspects and verifies the changes.
+While a shared workhorse holds the writer lease, Claude must not edit that checkout. Claude inspects the diff and test evidence after the reply. The same no-concurrent-edit rule applies to a shared `imagegen` worker.
 
-### Parallel workhorses
+### Codex image generation
 
-Start the first worker normally. Additional `-Isolation auto` workhorses for the same clean Git repository receive separate managed worktrees:
+Use a dedicated image worker even though it writes an output file:
 
 ```powershell
-$api = & "$coReview\new-worker.ps1" -Name "api-task" -Mode workhorse -Task "Implement API task" -ProjectCwd $repo -Model $model -Reasoning medium -Isolation auto | Select-Object -Last 1 | ConvertFrom-Json
-$ui  = & "$coReview\new-worker.ps1" -Name "ui-task"  -Mode workhorse -Task "Implement UI task"  -ProjectCwd $repo -Model $model -Reasoning medium -Isolation auto | Select-Object -Last 1 | ConvertFrom-Json
+$imageWorker = & "$coReview\new-worker.ps1" `
+  -Name "hero-art" -Mode imagegen `
+  -Task 'Generate the requested hero image with the $imagegen skill' `
+  -ProjectCwd (Get-Location).Path -Model $model -Reasoning low `
+  -Isolation auto -TimeoutSec 600 -MaxTurns 2 | Select-Object -Last 1 | ConvertFrom-Json
 
-& "$coReview\send-worker.ps1" -WorkerId $api.worker_id -Message "Implement and verify only the API task."
-& "$coReview\send-worker.ps1" -WorkerId $ui.worker_id  -Message "Implement and verify only the UI task."
-
-& "$coReview\recv-worker.ps1" -WorkerId $api.worker_id -Wait -TimeoutSec 1800
-& "$coReview\recv-worker.ps1" -WorkerId $ui.worker_id  -Wait -TimeoutSec 1800
+& "$coReview\ask-worker.ps1" -WorkerId $imageWorker.worker_id `
+  -Message 'Use $imagegen and the image-generation tool now. Create the requested raster image, save it under assets/hero.png, and report the absolute output path. Do not return only a prompt or substitute SVG/HTML.' `
+  -TurnTimeoutSec 600 -TimeoutSec 630
 ```
 
-Each isolated workhorse commits to its dedicated branch. Claude reviews and integrates each branch separately.
+The `imagegen` initialization envelope independently tells Codex that image generation is available, requires the installed `$imagegen` skill, and requires an actual image-generation tool call. For edits, provide an accessible source-image path; Codex must inspect it first. Claude verifies that every reported output file exists before finishing.
 
-## Configuration options
+## Control and recovery
 
-`new-worker.ps1` supports:
+```powershell
+& "$coReview\list-workers.ps1" -Json
+& "$coReview\cancel-worker.ps1" -WorkerId $worker.worker_id
+& "$coReview\ensure-worker.ps1" -WorkerId $worker.worker_id -Json
+& "$coReview\end-worker.ps1" -WorkerId $worker.worker_id
+```
 
-- `-Name`, `-Task`, `-Mode`, `-ProjectCwd`
-- `-Model`, `-Reasoning`, `-AllowUnknownModel`
-- `-Isolation auto|shared|worktree`, `-AllowDirtyBase`
-- `-Sandbox`, `-ConfirmDangerFullAccess`
-- `-WindowMode Hidden|Minimized|Foreground` (default `Hidden`)
-- `-TimeoutSec`
-- `-Profile`
-- `-AddDir <path[]>`
-- `-Search`
-- `-ConfigOverride <key=value[]>`
+`cancel-worker.ps1` stops the active Codex process without killing the listener; pass `-MessageId` to cancel a queued turn. `ensure-worker.ps1` restarts a dead listener while preserving the thread and queue. An interrupted active turn is returned as an error and is never replayed automatically, which prevents duplicate writes.
 
-Generic config overrides cannot replace guarded model, reasoning, sandbox, approval, working-directory, output, thread, or multi-agent settings.
+## Guardrails
 
-Per-turn `ask-worker.ps1` and `send-worker.ps1` may override `-Model`, `-Reasoning`, and `-TurnTimeoutSec`. They cannot change mode or sandbox.
+- Review workers are always read-only.
+- Shared-checkout `workhorse` and `imagegen` workers hold a writer lease; Claude pauses its edits until release.
+- Parallel writers use separate managed Git worktrees and never auto-merge.
+- Automatic worktree isolation refuses a dirty source repository unless the user accepts `-AllowDirtyBase` committed-HEAD-only context.
+- Use `danger-full-access` only when explicitly requested and pass `-ConfirmDangerFullAccess`.
+- Do not ask workers to spawn agents. The listener forces `features.multi_agent=false`.
+- New workers allow two turns by default. Use `-MaxTurns 0` only when the user explicitly wants an open-ended persistent worker.
+- Allow at most four live workers by default. Beyond four, require an explicit user request and pass `-AllowHighFanout`. Each `new-worker.ps1` call creates one leaf Codex process; never enable nested Codex agents.
+- Keep progress at the default two meaningful updates per turn. Set `-MaxProgressUpdates 0` to disable it.
+- `-Queue` and `-LeaveRunning` are explicit escape hatches, not normal workflow.
 
 ## Command reference
 
 | Command | Purpose |
 |---|---|
-| `get-capabilities.ps1` | Show installed models, reasoning levels, and supported worker options |
-| `new-worker.ps1` | Start a named review/workhorse worker |
-| `ask-worker.ps1` | Send one task and wait for its correlated reply |
-| `send-worker.ps1` | Queue a task without blocking |
-| `recv-worker.ps1` | Poll or wait for replies |
-| `list-workers.ps1` | Show names, modes, models, directories, threads, leases, and status |
-| `ensure-worker.ps1` | Verify/restart a remembered listener without losing its queue/thread |
+| `get-capabilities.ps1` | Discover installed models and reasoning levels |
+| `new-worker.ps1` | Start a bounded review/workhorse worker |
+| `ask-worker.ps1` | Send one task and wait; cancel on wait timeout by default |
+| `send-worker.ps1` | Queue one task without blocking; refuses busy workers |
+| `recv-worker.ps1` | Poll progress or wait for the correlated final reply |
+| `list-workers.ps1` | Show `idle`/`busy`, elapsed time, queue, thread, and lease state |
+| `cancel-worker.ps1` | Cancel an active or queued turn |
+| `ensure-worker.ps1` | Verify/restart a listener without replaying interrupted work |
 | `end-worker.ps1` | Stop and optionally archive/delete a worker |
-| `purge-worker.ps1` | Permanently delete stopped worker logs/state |
+| `purge-worker.ps1` | Permanently delete stopped worker state |
 
-The old pair-oriented commands remain compatibility aliases for existing users. Legacy pairs are interpreted as shared, read-only review workers.
+Legacy pair-oriented commands remain compatibility aliases.
 
-## Recovery
+## Disagreement
 
-Remember each `worker_id`. If a session resumes after sleep/reboot:
+Claude must evaluate rather than blindly relay a reply. For correctness/security disagreement, show the two verdicts briefly and let the user decide. Ignore purely stylistic disagreement unless requested. Cross-family divergence is useful signal, but it is not a reason to start an unbounded debate between models.
 
-```powershell
-& "$coReview\ensure-worker.ps1" -WorkerId $workerId -Json
-```
-
-`ask-worker.ps1` and `send-worker.ps1` also ensure the listener before queueing. Restart preserves message history and the Codex thread ID in `state.json`.
-
-## Result handling and disagreement
-
-Claude evaluates every reply rather than blindly relaying it.
-
-- Correctness/security disagreement between Claude and Codex: show both verdicts to the user, labeled `Claude:` and `Codex:`, with a short weighting note. The user resolves it.
-- Stylistic/taste disagreement: keep it out of the main thread; optionally append one summary line to the worker's `disagreements.log`.
-- Workhorse result: verify changed files and tests before claiming success.
-
-Cross-family disagreement is useful signal. Do not silently erase behavioral or security divergence.
-
-## Windows and privacy notes
-
-- Requires Windows PowerShell 5.1+ and the Codex CLI.
-- Background is `Hidden` by default. `Minimized` or `Foreground` shows the listener log console; it is still not the interactive Codex TUI.
-- Prompts and replies persist under `~/.cc-codex-pairs/<pair-id>/` until archived or deleted.
-- Managed worktrees live under `~/.cc-codex-worktrees/` and are retained by default.
-- Do not send secrets unless the user accepts local persistence and Codex processing.
-- If downloaded scripts are blocked, run `Get-ChildItem "$env:USERPROFILE\.claude\skills\co-review" -Recurse | Unblock-File` once.
+Prompts, replies, state, and logs persist under `~/.cc-codex-pairs/`. Managed worktrees live under `~/.cc-codex-worktrees/` and are retained by default.

@@ -220,7 +220,7 @@ function Get-CodexCapabilities {
         cache_stale = $cacheStale
         cli_version = $cliVersion
         models = @($models)
-        modes = @("review", "workhorse")
+        modes = @("review", "workhorse", "imagegen")
         sandboxes = @("read-only", "workspace-write", "danger-full-access")
         isolation = @("auto", "shared", "worktree")
         window_modes = @("Hidden", "Minimized", "Foreground")
@@ -332,6 +332,21 @@ Implement the bounded task in the working directory, run verification appropriat
         if ([string]$Meta.isolation -eq "worktree") {
             $contract += "`nThis is an isolated managed Git worktree. Commit the verified bounded change to its dedicated branch; Claude will review and integrate it.`n"
         }
+    } elseif ($mode -eq "imagegen") {
+        $contract = @"
+Act as Codex's dedicated image-generation specialist. Invoke the installed `$imagegen skill and follow it exactly. Use the image-generation tool to create or edit the requested image; do not substitute SVG, HTML, a drawing library, or a text-only prompt unless Claude explicitly asks for that instead.
+
+Codex can generate images in this environment. Do not reject the task based on stale product knowledge. Actually call the image-generation tool unless a required source image is unavailable. For an edit, inspect the source image first. Save the resulting image in the working directory or the exact path requested by Claude.
+
+Report:
+- outcome
+- generated image path or paths
+- a concise description of what was generated or edited
+- remaining blockers or risks
+"@
+        if ([string]$Meta.isolation -eq "worktree") {
+            $contract += "`nThis is an isolated managed Git worktree. Commit the generated image files to its dedicated branch so Claude can review and integrate them.`n"
+        }
     } else {
         $contract = @"
 Inspect the requested scope and return an evidence-backed review. You MUST NOT edit files.
@@ -340,6 +355,15 @@ Report:
 - prioritized findings with file references
 - uncertainty
 - recommended next actions
+"@
+    }
+
+    $progressContract = ""
+    if ([int]$Meta.max_progress_updates -gt 0) {
+        $progressContract = @"
+
+PROGRESS UPDATES:
+If you find a high-confidence result that could change Claude's immediate direction and you will keep working, send a brief agent update beginning exactly with CO_REVIEW_PROGRESS:. Send at most $([int]$Meta.max_progress_updates) such updates. Do not report routine exploration, plans, or reassurance.
 "@
     }
 
@@ -354,6 +378,7 @@ Do not broaden the task or permissions. Report blockers instead.
 
 COMPLETION CONTRACT:
 $($contract.Trim())
+$progressContract
 
 TASK FROM CLAUDE:
 $Task
@@ -382,11 +407,36 @@ function Get-NormalizedPairMetadata {
         $meta | Add-Member -NotePropertyName add_dirs -NotePropertyValue @() -Force
         $meta | Add-Member -NotePropertyName search_enabled -NotePropertyValue $false -Force
         $meta | Add-Member -NotePropertyName config_overrides -NotePropertyValue @() -Force
+        $meta | Add-Member -NotePropertyName max_turns -NotePropertyValue 0 -Force
+        $meta | Add-Member -NotePropertyName max_progress_updates -NotePropertyValue 0 -Force
+        $meta | Add-Member -NotePropertyName progress_min_interval_sec -NotePropertyValue 30 -Force
     }
     if ([string]::IsNullOrWhiteSpace([string]$meta.worker_name)) {
         $meta | Add-Member -NotePropertyName worker_name -NotePropertyValue ([string]$meta.pair_id) -Force
     }
+    if ($null -eq $meta.PSObject.Properties["max_turns"]) {
+        # Existing workers remain unlimited for backward compatibility. New
+        # workers get a bounded default through new-worker.ps1.
+        $meta | Add-Member -NotePropertyName max_turns -NotePropertyValue 0 -Force
+    }
+    if ($null -eq $meta.PSObject.Properties["max_progress_updates"]) {
+        $meta | Add-Member -NotePropertyName max_progress_updates -NotePropertyValue 0 -Force
+    }
+    if ($null -eq $meta.PSObject.Properties["progress_min_interval_sec"]) {
+        $meta | Add-Member -NotePropertyName progress_min_interval_sec -NotePropertyValue 30 -Force
+    }
     return $meta
+}
+
+function Get-CoReviewActiveWorkerCount {
+    $root = Get-CoReviewRoot
+    if (-not (Test-Path -LiteralPath $root -PathType Container)) { return 0 }
+    $count = 0
+    foreach ($dir in @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "pair-*" })) {
+        $listenerPid = $null
+        if (Test-CoReviewListenerAlive -PairDir $dir.FullName -ListenerPid ([ref]$listenerPid)) { $count++ }
+    }
+    return $count
 }
 
 function Get-CoReviewMutexName {

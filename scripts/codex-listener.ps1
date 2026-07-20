@@ -28,6 +28,9 @@ $pairMeta  = Join-Path $pairDir "pair.json"
 $logFile   = Join-Path $pairDir "listener.log"
 $shutdownFile = Join-Path $pairDir "shutdown"
 $pidFile   = Join-Path $pairDir "listener.pid"
+$activeTurnFile = Join-Path $pairDir "active-turn.json"
+$progressStateFile = Join-Path $pairDir "progress.json"
+$cancelDir = Join-Path $pairDir "cancelled"
 
 # Write our PID so list-pairs can verify the listener is actually alive
 [System.IO.File]::WriteAllText($pidFile, $PID, [System.Text.UTF8Encoding]::new($false))
@@ -52,12 +55,14 @@ $workerSandbox = [string]$meta.sandbox
 $workerIsolation = [string]$meta.isolation
 
 $metadataError = ""
-if ($workerMode -notin @("review", "workhorse")) {
+if ($workerMode -notin @("review", "workhorse", "imagegen")) {
     $metadataError = "Invalid worker mode '$workerMode' in schema-v$schemaVersion pair metadata"
 } elseif ($workerSandbox -notin @("read-only", "workspace-write", "danger-full-access")) {
     $metadataError = "Invalid worker sandbox '$workerSandbox' in schema-v$schemaVersion pair metadata"
 } elseif ($workerMode -eq "review" -and $workerSandbox -ne "read-only") {
     $metadataError = "Review workers must use the read-only sandbox"
+} elseif ($workerMode -eq "imagegen" -and $workerSandbox -eq "read-only") {
+    $metadataError = "Imagegen workers require a writable sandbox"
 }
 if ($metadataError) {
     Write-Host "[co-review] FATAL: $metadataError" -ForegroundColor Red
@@ -113,7 +118,7 @@ function Get-State {
     if (Test-Path $stateFile) {
         return Get-Content $stateFile -Raw | ConvertFrom-Json
     }
-    return [PSCustomObject]@{ last_processed = $null; codex_session_id = $null; msg_counter = 0 }
+    return [PSCustomObject]@{ last_processed = $null; codex_session_id = $null; msg_counter = 0; completed_turns = 0 }
 }
 
 function Save-State {
@@ -205,10 +210,16 @@ function Invoke-Codex {
         [string]$Profile,
         [string[]]$AddDir = @(),
         [bool]$Search = $false,
-        [string[]]$ConfigOverrides = @()
+        [string[]]$ConfigOverrides = @(),
+        [string]$MessageId,
+        [string]$ActiveTurnFile,
+        [string]$ProgressStateFile,
+        [int]$MaxProgressUpdates = 0,
+        [int]$ProgressMinIntervalSec = 30
     )
 
     $lastMsgFile = New-TemporaryFile
+    $stdoutEventFile = New-TemporaryFile
 
     try {
         Assert-SafeCodexConfigOverrides -Overrides $ConfigOverrides
@@ -266,16 +277,62 @@ function Invoke-Codex {
 
         $proc = [System.Diagnostics.Process]::Start($procInfo)
 
-        # Drain stdout/stderr concurrently. This avoids pipe-buffer deadlocks and
-        # lets us enforce a timeout even if Codex hangs mid-turn.
+        if (-not [string]::IsNullOrWhiteSpace($ProgressStateFile)) {
+            Remove-Item -LiteralPath $ProgressStateFile -Force -ErrorAction SilentlyContinue
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($ActiveTurnFile)) {
+            $active = [ordered]@{
+                message_id = $MessageId
+                listener_pid = $PID
+                process_pid = $proc.Id
+                started_at = (Get-Date).ToString("o")
+                timeout_sec = $TimeoutSec
+            } | ConvertTo-Json
+            [System.IO.File]::WriteAllText($ActiveTurnFile, $active, [System.Text.UTF8Encoding]::new($false))
+        }
+
+        # Drain JSONL stdout line-by-line so explicitly marked agent updates can
+        # reach Claude before the turn finishes. Keep all raw events for final
+        # session-id/reply processing.
         $stdoutRunspace = [runspacefactory]::CreateRunspace()
         $stdoutRunspace.Open()
         $stdoutPs = [powershell]::Create()
         $stdoutPs.Runspace = $stdoutRunspace
         [void]$stdoutPs.AddScript({
-            param($p)
-            $p.StandardOutput.ReadToEnd()
-        }).AddArgument($proc)
+            param($p, $eventPath, $outboxPath, $progressPath, $messageId, $maxUpdates, $minIntervalSec)
+            $utf8 = [System.Text.UTF8Encoding]::new($false)
+            $count = 0
+            $lastProgress = [DateTimeOffset]::MinValue
+            while ($null -ne ($line = $p.StandardOutput.ReadLine())) {
+                [System.IO.File]::AppendAllText($eventPath, $line + [Environment]::NewLine, $utf8)
+                if ($maxUpdates -le 0 -or $count -ge $maxUpdates) { continue }
+                try { $event = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+                $text = ""
+                if ($event.type -eq "item.completed" -and $event.item.type -eq "agent_message") { $text = [string]$event.item.text }
+                elseif ($event.type -eq "agent_message" -and $event.message) { $text = [string]$event.message }
+                $trimmed = $text.TrimStart()
+                $prefix = "CO_REVIEW_PROGRESS:"
+                if (-not $trimmed.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+                $now = [DateTimeOffset]::Now
+                if ($count -gt 0 -and ($now - $lastProgress).TotalSeconds -lt $minIntervalSec) { continue }
+                $content = $trimmed.Substring($prefix.Length).Trim()
+                if ([string]::IsNullOrWhiteSpace($content)) { continue }
+                $count++
+                $progress = [ordered]@{
+                    id = "prg-$messageId-{0:D2}" -f $count
+                    ts = $now.ToString("o")
+                    from = "codex"
+                    in_reply_to = $messageId
+                    type = "progress"
+                    content = $content
+                }
+                [System.IO.File]::AppendAllText($outboxPath, (($progress | ConvertTo-Json -Compress -Depth 10) + [Environment]::NewLine), $utf8)
+                $progressState = [ordered]@{ message_id=$messageId; count=$count; last_progress_at=$progress.ts; last_progress=$content }
+                [System.IO.File]::WriteAllText($progressPath, ($progressState | ConvertTo-Json -Depth 5), $utf8)
+                $lastProgress = $now
+            }
+        }).AddArgument($proc).AddArgument($stdoutEventFile.FullName).AddArgument($toClaude).AddArgument($ProgressStateFile).AddArgument($MessageId).AddArgument($MaxProgressUpdates).AddArgument($ProgressMinIntervalSec)
         $stdoutHandle = $stdoutPs.BeginInvoke()
 
         $stderrRunspace = [runspacefactory]::CreateRunspace()
@@ -303,18 +360,14 @@ function Invoke-Codex {
             } catch {
                 try { $proc.Kill() } catch {}
             }
-            $proc.WaitForExit()
+            [void]$proc.WaitForExit(10000)
         }
 
         # Collect stdout/stderr from the background runspaces.
-        $stdoutText = ""
         try {
-            $stdoutResult = $stdoutPs.EndInvoke($stdoutHandle)
-            if ($stdoutResult) {
-                $stdoutText = if ($stdoutResult -is [string]) { $stdoutResult } else { [string]$stdoutResult }
-            }
+            if (-not $stdoutHandle.IsCompleted) { $stdoutPs.Stop() }
+            [void]$stdoutPs.EndInvoke($stdoutHandle)
         } catch {
-            $stdoutText = ""
         } finally {
             $stdoutPs.Dispose()
             $stdoutRunspace.Close()
@@ -322,7 +375,7 @@ function Invoke-Codex {
         }
 
         $stdoutLines = New-Object System.Collections.Generic.List[string]
-        foreach ($line in ($stdoutText -split "`r?`n")) {
+        foreach ($line in @(Get-Content -LiteralPath $stdoutEventFile.FullName -Encoding UTF8 -ErrorAction SilentlyContinue)) {
             if (-not [string]::IsNullOrWhiteSpace($line)) {
                 $stdoutLines.Add($line) | Out-Null
                 Write-Host "    $line" -ForegroundColor DarkGray
@@ -331,6 +384,7 @@ function Invoke-Codex {
 
         $stderr = ""
         try {
+            if (-not $stderrHandle.IsCompleted) { $stderrPs.Stop() }
             $stderrResult = $stderrPs.EndInvoke($stderrHandle)
             if ($stderrResult) {
                 $stderr = if ($stderrResult -is [string]) { $stderrResult } else { [string]$stderrResult }
@@ -384,12 +438,48 @@ function Invoke-Codex {
             StdoutLines = $stdoutLines
         }
     } finally {
+        if (-not [string]::IsNullOrWhiteSpace($ActiveTurnFile)) {
+            Remove-Item -LiteralPath $ActiveTurnFile -Force -ErrorAction SilentlyContinue
+        }
         Remove-Item -ErrorAction SilentlyContinue $lastMsgFile.FullName
+        Remove-Item -ErrorAction SilentlyContinue $stdoutEventFile.FullName
     }
 }
 
 # Main loop
 Write-Log "Listener started for $PairId"
+
+# A hard-killed listener used to leave the current request unacknowledged. On
+# restart that caused a mutating writable-worker turn to run a second time. Convert a
+# stale active-turn marker into a correlated interruption error instead.
+if (Test-Path -LiteralPath $activeTurnFile -PathType Leaf) {
+    try {
+        $interrupted = Get-Content -LiteralPath $activeTurnFile -Raw | ConvertFrom-Json
+        $interruptedId = [string]$interrupted.message_id
+        if ($interruptedId -match '^msg-\d+$') {
+            $alreadyReplied = $false
+            if (Test-Path -LiteralPath $toClaude) {
+                foreach ($line in @(Get-Content -LiteralPath $toClaude -Encoding UTF8 -ErrorAction SilentlyContinue)) {
+                    try { $replyObj = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+                    if ([string]$replyObj.in_reply_to -eq $interruptedId -and [string]$replyObj.type -in @("response", "error")) { $alreadyReplied = $true; break }
+                }
+            }
+            if (-not $alreadyReplied) {
+                [void](Append-Reply -InReplyTo $interruptedId -Content "" -ErrMsg "Codex turn was interrupted when the listener stopped; it was not replayed automatically.")
+                $recoveryState = Get-State
+                $recoveryState.last_processed = $interruptedId
+                $completed = if ($null -ne $recoveryState.PSObject.Properties['completed_turns']) { [int]$recoveryState.completed_turns } else { 0 }
+                $recoveryState | Add-Member -NotePropertyName completed_turns -NotePropertyValue ($completed + 1) -Force
+                Save-State $recoveryState
+                Write-Log "Recovered interrupted $interruptedId without replaying it"
+            }
+        }
+    } catch {
+        Write-Log "Could not recover stale active turn: $($_.Exception.Message)"
+    } finally {
+        Remove-Item -LiteralPath $activeTurnFile -Force -ErrorAction SilentlyContinue
+    }
+}
 
 while ($true) {
     if (Test-Path $shutdownFile) {
@@ -412,7 +502,17 @@ while ($true) {
         Write-Log "Processing $($msg.id) (type=$($msg.type), $($msg.content.Length) chars)"
 
         $capturedSid = $null
-        if ($DryRun) {
+        $cancelMarker = Join-Path $cancelDir ([string]$msg.id + ".cancel")
+        $completedTurns = if ($null -ne $state.PSObject.Properties['completed_turns']) { [int]$state.completed_turns } else { 0 }
+        $maxTurns = [int]$meta.max_turns
+        if (Test-Path -LiteralPath $cancelMarker -PathType Leaf) {
+            $rid = Append-Reply -InReplyTo $msg.id -Content "" -ErrMsg "Codex turn was cancelled before execution."
+            Remove-Item -LiteralPath $cancelMarker -Force -ErrorAction SilentlyContinue
+            Write-Log "Cancelled queued $($msg.id) before execution"
+        } elseif ($maxTurns -gt 0 -and $completedTurns -ge $maxTurns) {
+            $rid = Append-Reply -InReplyTo $msg.id -Content "" -ErrMsg "Worker turn limit reached ($maxTurns). Start a fresh worker or explicitly create one with a larger -MaxTurns value."
+            Write-Log "Rejected $($msg.id): max_turns=$maxTurns"
+        } elseif ($DryRun) {
             $reply = "[DRY RUN] Echo of your message:`n`n$($msg.content)"
             $rid = Append-Reply -InReplyTo $msg.id -Content $reply
             Write-Host "<<< Replied (dry run) as $rid" -ForegroundColor Magenta
@@ -433,7 +533,7 @@ while ($true) {
                     Write-Log "Reasoning override on $($msg.id): $effectiveReasoning"
                 }
                 $envelope = New-CodexTaskEnvelope -Meta $meta -Task ([string]$msg.content)
-                $result = Invoke-Codex -Prompt $envelope -SessionId $sid -Cwd $workDir -Model $effectiveModel -Reasoning $effectiveReasoning -Sandbox $workerSandbox -TimeoutSec $effectiveTimeout -Profile $workerProfile -AddDir $workerAddDirs -Search $workerSearch -ConfigOverrides $workerConfigOverrides
+                $result = Invoke-Codex -Prompt $envelope -SessionId $sid -Cwd $workDir -Model $effectiveModel -Reasoning $effectiveReasoning -Sandbox $workerSandbox -TimeoutSec $effectiveTimeout -Profile $workerProfile -AddDir $workerAddDirs -Search $workerSearch -ConfigOverrides $workerConfigOverrides -MessageId ([string]$msg.id) -ActiveTurnFile $activeTurnFile -ProgressStateFile $progressStateFile -MaxProgressUpdates ([int]$meta.max_progress_updates) -ProgressMinIntervalSec ([int]$meta.progress_min_interval_sec)
 
                 if ($result.ExitCode -ne 0) {
                     $stderrText = [string]$result.Stderr
@@ -463,10 +563,14 @@ while ($true) {
             }
         }
 
+        Remove-Item -LiteralPath $cancelMarker -Force -ErrorAction SilentlyContinue
+
         # One state save per message - load fresh, apply both updates, save once.
         # (Append-Reply doesn't touch state.json, so the only writer here is this block.)
         $state = Get-State
         $state.last_processed = $msg.id
+        $completed = if ($null -ne $state.PSObject.Properties['completed_turns']) { [int]$state.completed_turns } else { 0 }
+        $state | Add-Member -NotePropertyName completed_turns -NotePropertyValue ($completed + 1) -Force
         if ($capturedSid) {
             $state | Add-Member -NotePropertyName codex_session_id -NotePropertyValue $capturedSid -Force
         }

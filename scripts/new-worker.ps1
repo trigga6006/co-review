@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory=$true)][string]$Name,
-    [Parameter(Mandatory=$true)][ValidateSet("review", "workhorse")][string]$Mode,
+    [Parameter(Mandatory=$true)][ValidateSet("review", "workhorse", "imagegen")][string]$Mode,
     [string]$Task = "",
     [string]$ProjectCwd = "",
     [string]$CodexBin = "",
@@ -11,7 +11,12 @@ param(
     [ValidateSet("auto", "shared", "worktree")][string]$Isolation = "auto",
     [ValidateSet("", "read-only", "workspace-write", "danger-full-access")][string]$Sandbox = "",
     [ValidateSet("Hidden", "Minimized", "Foreground")][string]$WindowMode = "Hidden",
-    [int]$TimeoutSec = 1800,
+    [int]$TimeoutSec = 300,
+    [ValidateRange(0, 1000)][int]$MaxTurns = 2,
+    [ValidateRange(0, 10)][int]$MaxProgressUpdates = 2,
+    [ValidateRange(0, 3600)][int]$ProgressMinIntervalSec = 30,
+    [ValidateRange(1, 1000)][int]$MaxConcurrentWorkers = 4,
+    [switch]$AllowHighFanout,
     [string]$Profile = "",
     [string[]]$AddDir = @(),
     [switch]$Search,
@@ -37,9 +42,19 @@ $selection = Resolve-CodexSelection -Capabilities $capabilities -Model $Model -R
 $params = @{
     WorkerName = $Name; Mode = $Mode; Task = $Task; ProjectCwd = $ProjectCwd; CodexBin = $CodexBin
     CodexModel = $Model; CodexReasoning = $Reasoning; Isolation = $Isolation; Sandbox = $Sandbox
-    WindowMode = $WindowMode; CodexTimeoutSec = $TimeoutSec; Profile = $Profile; AddDir = $AddDir
+    WindowMode = $WindowMode; CodexTimeoutSec = $TimeoutSec; MaxTurns = $MaxTurns; MaxProgressUpdates = $MaxProgressUpdates
+    ProgressMinIntervalSec = $ProgressMinIntervalSec; Profile = $Profile; AddDir = $AddDir
     ConfigOverride = $ConfigOverride; Search = $Search; AllowDirtyBase = $AllowDirtyBase
     ConfirmDangerFullAccess = $ConfirmDangerFullAccess; NoSpawn = $NoSpawn; DryRunListener = $DryRunListener
 }
-$output = & (Join-Path $PSScriptRoot "new-pair.ps1") @params
+$mutexName = Get-CoReviewMutexName -Scope "fanout" -Key "global"
+$output = Invoke-WithCoReviewMutex -Name $mutexName -ScriptBlock {
+    if (-not $NoSpawn -and -not $AllowHighFanout) {
+        $activeCount = Get-CoReviewActiveWorkerCount
+        if ($activeCount -ge $MaxConcurrentWorkers) {
+            throw "Active co-review worker limit reached ($activeCount/$MaxConcurrentWorkers). Reuse/stop a worker or pass -AllowHighFanout for explicit fan-out."
+        }
+    }
+    & (Join-Path $PSScriptRoot "new-pair.ps1") @params
+}
 $output | Select-Object -Last 1

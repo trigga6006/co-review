@@ -13,7 +13,7 @@ $result = Invoke-WithCoReviewMutex -Name $mutexName -ScriptBlock {
 
     $leaseAcquired = $false
     try {
-        if ([string]$meta.mode -eq "workhorse") {
+        if ([string]$meta.mode -in @("workhorse", "imagegen")) {
             Acquire-WriterLease -PairId $PairId -PairDir $pairDir -WorkingDirectory ([string]$meta.project_cwd) | Out-Null
             $leaseAcquired = $true
         }

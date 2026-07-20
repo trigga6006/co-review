@@ -38,7 +38,8 @@ Write-Output ""
 Write-Output "Mode defaults:"
 $modeTable = @(
     [PSCustomObject]@{ mode = "review"; sandbox = "read-only" },
-    [PSCustomObject]@{ mode = "workhorse"; sandbox = "workspace-write" }
+    [PSCustomObject]@{ mode = "workhorse"; sandbox = "workspace-write" },
+    [PSCustomObject]@{ mode = "imagegen"; sandbox = "workspace-write" }
 ) | Format-Table -AutoSize | Out-String
 Write-Output $modeTable.TrimEnd()
 Write-Output "Default selection: model=$($capabilities.defaults.model), reasoning=$($capabilities.defaults.reasoning), isolation=$($capabilities.defaults.isolation), window=$($capabilities.defaults.window_mode)"

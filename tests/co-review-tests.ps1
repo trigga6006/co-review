@@ -41,12 +41,20 @@ using System.IO;
 using System.Text;
 using System.Threading;
 public static class $typeName {
+    private static string JsonEscape(string value) {
+        return value.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\r", "\\r").Replace("\n", "\\n");
+    }
     public static int Main(string[] args) {
         if (args.Length == 1 && args[0] == "--version") {
             Console.WriteLine("codex-cli $Version-test");
             return 0;
         }
 
+        string progress = Environment.GetEnvironmentVariable("CO_REVIEW_TEST_PROGRESS");
+        if (!String.IsNullOrWhiteSpace(progress)) {
+            Console.WriteLine("{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"CO_REVIEW_PROGRESS: " + JsonEscape(progress) + "\"}}");
+            Console.Out.Flush();
+        }
         Thread.Sleep($SleepMs);
         string argsPath = Environment.GetEnvironmentVariable("CO_REVIEW_TEST_ARGS");
         if (!String.IsNullOrWhiteSpace(argsPath)) {
@@ -128,7 +136,7 @@ function Test-ListenerReturnsTimeoutError {
     ) -WindowStyle Hidden -PassThru
     try {
         Start-Sleep -Seconds 1
-        $replyJson = & (Join-Path $Scripts "ask.ps1") -PairId $pair.pair_id -Message "timeout please" -TimeoutSec 20 -RawJson | Select-Object -Last 1
+        $replyJson = & (Join-Path $Scripts "ask.ps1") -PairId $pair.pair_id -Message "timeout please" -TimeoutSec 20 -RawJson -AllowErrorReply | Select-Object -Last 1
         $reply = $replyJson | ConvertFrom-Json
         Assert-True ($reply.type -eq "error") "timeout should produce an error reply"
         Assert-True ($reply.error -match "timed out") "timeout error should mention timed out"
@@ -180,6 +188,7 @@ function Invoke-WorkerModeTurn {
         if (-not [string]::IsNullOrWhiteSpace($Model)) { $askArgs.Model = $Model }
         if (-not [string]::IsNullOrWhiteSpace($Reasoning)) { $askArgs.Reasoning = $Reasoning }
         if ($TurnTimeoutSec -gt 0) { $askArgs.TurnTimeoutSec = $TurnTimeoutSec }
+        if ($ExpectError) { $askArgs.AllowErrorReply = $true }
         $replyJson = & (Join-Path $Scripts "ask.ps1") @askArgs | Select-Object -Last 1
         $reply = $replyJson | ConvertFrom-Json
         if ($ExpectError) {
@@ -270,6 +279,7 @@ function Test-WorkerModes {
     $env:CODEX_HOME = $codexHome
     $review = $null
     $workhorse = $null
+    $imagegen = $null
     $configuredDefault = $null
     $failing = $null
     $tampered = $null
@@ -370,9 +380,29 @@ function Test-WorkerModes {
         Assert-True ($workhorseTurn.Stdin -match "implement") "workhorse envelope should require implementation"
         Assert-True ($workhorseTurn.Stdin -match "run verification") "workhorse envelope should require verification"
 
+        $imagegenJson = & (Join-Path $Scripts "new-pair.ps1") -NoSpawn -Task "generate a hero image" -WorkerName "image-maker" -Mode imagegen -CodexBin $fakeCodex -CodexModel "gpt-test-frontier" -CodexReasoning low | Select-Object -Last 1
+        $imagegen = $imagegenJson | ConvertFrom-Json
+        $imagegenMeta = Get-Content -LiteralPath (Join-Path $imagegen.pair_dir "pair.json") -Raw | ConvertFrom-Json
+        Assert-True ($imagegenMeta.mode -eq "imagegen") "image workers should persist imagegen mode"
+        Assert-True ($imagegenMeta.sandbox -eq "workspace-write") "imagegen workers should default to workspace-write"
+
+        $imagegenTurn = Invoke-WorkerModeTurn -Pair $imagegen -FakeCodex $fakeCodex -CaptureDir (Join-Path $tempRoot "imagegen-capture") -Message "create the requested raster image under assets/hero.png"
+        $imagegen = $null
+        $imagegenExec = [Array]::IndexOf($imagegenTurn.Args, "exec")
+        $imagegenSandbox = [Array]::IndexOf($imagegenTurn.Args, "--sandbox")
+        Assert-True ($imagegenSandbox -gt $imagegenExec -and $imagegenTurn.Args[$imagegenSandbox + 1] -eq "workspace-write") "imagegen turns should use workspace-write"
+        Assert-True (($imagegenTurn.Args -join "`n") -match "(?m)^features\.multi_agent=false$") "imagegen turns should disable multi-agent"
+        Assert-True ($imagegenTurn.Stdin -match "MODE: imagegen") "imagegen envelope should identify imagegen mode"
+        Assert-True ($imagegenTurn.Stdin -match '\$imagegen') "imagegen envelope should explicitly invoke the installed imagegen skill"
+        Assert-True ($imagegenTurn.Stdin -match "Actually call the image-generation tool") "imagegen envelope should require a real image-generation tool call"
+        Assert-True ($imagegenTurn.Stdin -match "Do not reject the task based on stale product knowledge") "imagegen envelope should override stale capability assumptions"
+
         $danger = Invoke-ScriptExpectFailure -ScriptName "new-pair.ps1" -ScriptArgs @("-NoSpawn", "-Task", "unsafe", "-Mode", "workhorse", "-Sandbox", "danger-full-access", "-CodexBin", $fakeCodex)
         Assert-True ($danger.ExitCode -ne 0) "danger-full-access should require explicit confirmation"
         Assert-True ($danger.Output -match "ConfirmDangerFullAccess") "danger-full-access failure should name the confirmation switch"
+
+        $readOnlyImagegen = Invoke-ScriptExpectFailure -ScriptName "new-pair.ps1" -ScriptArgs @("-NoSpawn", "-Task", "cannot save", "-Mode", "imagegen", "-Sandbox", "read-only", "-CodexBin", $fakeCodex)
+        Assert-True ($readOnlyImagegen.ExitCode -ne 0 -and $readOnlyImagegen.Output -match "writable sandbox") "imagegen workers should reject read-only sandboxes"
 
         $writableReview = Invoke-ScriptExpectFailure -ScriptName "new-pair.ps1" -ScriptArgs @("-NoSpawn", "-Task", "unsafe review", "-Mode", "review", "-Sandbox", "workspace-write", "-CodexBin", $fakeCodex)
         Assert-True ($writableReview.ExitCode -ne 0) "review workers should reject writable sandboxes"
@@ -397,6 +427,7 @@ function Test-WorkerModes {
     } finally {
         if ($null -ne $review -and (Test-Path -LiteralPath $review.pair_dir)) { & (Join-Path $Scripts "purge-pair.ps1") -PairId $review.pair_id -Force | Out-Null }
         if ($null -ne $workhorse -and (Test-Path -LiteralPath $workhorse.pair_dir)) { & (Join-Path $Scripts "purge-pair.ps1") -PairId $workhorse.pair_id -Force | Out-Null }
+        if ($null -ne $imagegen -and (Test-Path -LiteralPath $imagegen.pair_dir)) { & (Join-Path $Scripts "purge-pair.ps1") -PairId $imagegen.pair_id -Force | Out-Null }
         if ($null -ne $configuredDefault -and (Test-Path -LiteralPath $configuredDefault.pair_dir)) { & (Join-Path $Scripts "purge-pair.ps1") -PairId $configuredDefault.pair_id -Force | Out-Null }
         if ($null -ne $failing -and (Test-Path -LiteralPath $failing.pair_dir)) { & (Join-Path $Scripts "purge-pair.ps1") -PairId $failing.pair_id -Force | Out-Null }
         if ($null -ne $tampered -and (Test-Path -LiteralPath $tampered.pair_dir)) { & (Join-Path $Scripts "purge-pair.ps1") -PairId $tampered.pair_id -Force | Out-Null }
@@ -526,6 +557,7 @@ function Test-CapabilityDiscovery {
 
     Assert-True ($capabilities.modes -contains "review") "capabilities should expose review mode"
     Assert-True ($capabilities.modes -contains "workhorse") "capabilities should expose workhorse mode"
+    Assert-True ($capabilities.modes -contains "imagegen") "capabilities should expose imagegen mode"
     Assert-True ($capabilities.sandboxes -contains "read-only") "capabilities should expose read-only sandbox"
     Assert-True ($capabilities.sandboxes -contains "workspace-write") "capabilities should expose workspace-write sandbox"
     Assert-True ($capabilities.sandboxes -contains "danger-full-access") "capabilities should expose danger-full-access sandbox"
@@ -559,6 +591,7 @@ function Test-WorkerLifecycle {
         Assert-True ((Resolve-CoReviewWindowStyle -WindowMode Foreground) -eq "Normal") "Foreground should map to the PowerShell Normal window style"
         $startupJson = & (Join-Path $Scripts "new-worker.ps1") -Name "startup-timeout" -Mode review -Task "startup timeout" -ProjectCwd $projectWithSpaces -Model gpt-test-frontier -Reasoning medium -CodexBin $fakeCodex -DryRunListener -NoSpawn | Select-Object -Last 1
         $startupWorker = $startupJson | ConvertFrom-Json
+        Assert-True ($startupWorker.codex_timeout_sec -eq 300 -and $startupWorker.max_turns -eq 2) "new-worker should apply bounded latency defaults"
         $startupRejected = $false
         try { Start-CoReviewListener -PairId $startupWorker.worker_id -PairDir $startupWorker.pair_dir -WindowMode Hidden -StartupWaitSec 0 | Out-Null } catch { $startupRejected = $true }
         Assert-True $startupRejected "listener startup should fail instead of returning a null validated PID"
@@ -758,8 +791,8 @@ function Test-WorktreeIsolation {
 function Test-SkillCommandContracts {
     $skill = Get-Content -LiteralPath (Join-Path $RepoRoot "SKILL.md") -Raw
     foreach ($required in @(
-        "get-capabilities.ps1", "new-worker.ps1", "ask-worker.ps1", "send-worker.ps1", "recv-worker.ps1",
-        "list-workers.ps1", "ensure-worker.ps1", "end-worker.ps1", "review", "workhorse", "writer lease",
+        "get-capabilities.ps1", "new-worker.ps1", "ask-worker.ps1", "send-worker.ps1", "recv-worker.ps1", "cancel-worker.ps1",
+        "list-workers.ps1", "ensure-worker.ps1", "end-worker.ps1", "review", "workhorse", "imagegen", "writer lease",
         "worktree", "Hidden", "danger-full-access", "ConfirmDangerFullAccess", "leaf worker"
     )) {
         Assert-True ($skill -match [regex]::Escape($required)) "SKILL.md should document $required"
@@ -767,8 +800,161 @@ function Test-SkillCommandContracts {
     Assert-True ($skill -match "explicit.*user|user.*explicit") "explicit user model/reasoning choices should take precedence"
     Assert-True ($skill -match "cache_stale" -and $skill -match "configured-default") "skill should teach Claude to avoid automatic selection from a stale cache"
     Assert-True ($skill -match "Claude.*sole orchestrator") "SKILL.md should keep Claude as sole orchestrator"
+    Assert-True ($skill -match "two total turns|two turns" -and $skill -match "300-second|300 seconds") "SKILL.md should bound default latency and turn count"
+    Assert-True ($skill -match "Never select.*xhigh.*automatically") "SKILL.md should prohibit automatic extreme reasoning"
+    Assert-True ($skill -match "cancel.*timeout|timeout.*cancel") "SKILL.md should cancel hidden work after wait timeout"
+    Assert-True ($skill -match "progress updates" -and $skill -match "IncludeProgress" -and $skill -match "UntilFinal") "SKILL.md should teach bounded progress polling"
+    Assert-True ($skill -match "four live workers" -and $skill -match "AllowHighFanout") "SKILL.md should document the fan-out cap"
+    Assert-True ($skill -match 'select `imagegen`' -and $skill -match "Do not claim otherwise based on stale product knowledge") "SKILL.md should select imagegen directly and reject stale capability assumptions"
+    Assert-True ($skill -match "Actually call|actual image-generation tool call") "SKILL.md should require image generation rather than a prompt-only response"
     Assert-True ($skill -notmatch "Spawn at most one pair per Claude conversation") "obsolete one-pair restriction should be removed"
     Assert-True ($skill -notmatch "Codex runs with `--sandbox read-only` by default") "obsolete review-only limitation should be removed"
+}
+
+function Test-LatencyControls {
+    $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("co-review-latency-" + [System.Guid]::NewGuid().ToString("N"))
+    $slowCodex = New-FakeCodex -Directory (Join-Path $tempRoot "slow") -SleepMs 30000
+    $pair = $null
+    try {
+        $pair = (& (Join-Path $Scripts "new-pair.ps1") -NoSpawn -Task "busy cancellation" -CodexBin $slowCodex -CodexModel configured-default -CodexReasoning auto -CodexTimeoutSec 60 | Select-Object -Last 1) | ConvertFrom-Json
+        $listener = Start-Process powershell.exe -ArgumentList @(
+            "-NoProfile", "-File", (Join-Path $Scripts "codex-listener.ps1"), "-PairId", $pair.pair_id,
+            "-CodexBin", $slowCodex, "-PollIntervalSec", "1"
+        ) -WindowStyle Hidden -PassThru
+        Wait-ForListener -PairDir $pair.pair_dir
+
+        $messageId = & (Join-Path $Scripts "send-worker.ps1") -WorkerId $pair.pair_id -Message "slow turn" | Select-Object -Last 1
+        $activePath = Join-Path $pair.pair_dir "active-turn.json"
+        $deadline = (Get-Date).AddSeconds(10)
+        while (-not (Test-Path -LiteralPath $activePath) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 100 }
+        Assert-True (Test-Path -LiteralPath $activePath) "listener should publish active-turn status"
+
+        $listedJson = & (Join-Path $Scripts "list-workers.ps1") -Json
+        $listedParsed = $listedJson | ConvertFrom-Json
+        $listed = @(); foreach ($item in $listedParsed) { $listed += $item }
+        $current = $listed | Where-Object { $_.worker_id -eq $pair.pair_id } | Select-Object -First 1
+        Assert-True ($current.status -eq "busy" -and $current.active_message_id -eq $messageId -and $current.queue_depth -eq 1) "list-workers should expose busy state and queue depth"
+
+        $busySend = Invoke-ScriptExpectFailure -ScriptName "send-worker.ps1" -ScriptArgs @("-WorkerId",$pair.pair_id,"-Message","must not queue")
+        Assert-True ($busySend.ExitCode -ne 0 -and $busySend.Output -match "busy|queued") "send-worker should refuse accidental queueing"
+
+        $cancelled = & (Join-Path $Scripts "cancel-worker.ps1") -WorkerId $pair.pair_id -MessageId $messageId -Json | ConvertFrom-Json
+        Assert-True ($cancelled.active_process_stopped -eq $true) "cancel-worker should stop the active Codex process"
+        $replyDeadline = (Get-Date).AddSeconds(10)
+        $cancelReply = $null
+        while ($null -eq $cancelReply -and (Get-Date) -lt $replyDeadline) {
+            foreach ($line in @(Get-Content -LiteralPath (Join-Path $pair.pair_dir "to-claude.jsonl") -ErrorAction SilentlyContinue)) {
+                try { $candidate = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+                if ($candidate.in_reply_to -eq $messageId) { $cancelReply = $candidate; break }
+            }
+            if ($null -eq $cancelReply) { Start-Sleep -Milliseconds 100 }
+        }
+        Assert-True ($null -ne $cancelReply -and $cancelReply.type -eq "error") "cancelled active turn should receive a correlated error"
+    } finally {
+        if ($null -ne $pair -and (Test-Path -LiteralPath $pair.pair_dir)) { & (Join-Path $Scripts "end-pair.ps1") -PairId $pair.pair_id -Delete | Out-Null }
+        Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    $fakeCodex = New-FakeCodex -Directory (Join-Path $tempRoot "fast")
+    $limited = $null
+    try {
+        $limited = (& (Join-Path $Scripts "new-pair.ps1") -Task "turn limit" -CodexBin $fakeCodex -CodexModel configured-default -CodexReasoning auto -MaxTurns 1 -DryRunListener -WindowMode Hidden | Select-Object -Last 1) | ConvertFrom-Json
+        $first = & (Join-Path $Scripts "ask-worker.ps1") -WorkerId $limited.pair_id -Message "first" -TimeoutSec 20 -RawJson | Select-Object -Last 1 | ConvertFrom-Json
+        $second = & (Join-Path $Scripts "ask-worker.ps1") -WorkerId $limited.pair_id -Message "second" -TimeoutSec 20 -RawJson -AllowErrorReply | Select-Object -Last 1 | ConvertFrom-Json
+        Assert-True ($first.type -eq "response" -and $second.type -eq "error" -and $second.error -match "turn limit") "listener should enforce MaxTurns"
+    } finally {
+        if ($null -ne $limited -and (Test-Path -LiteralPath $limited.pair_dir)) { & (Join-Path $Scripts "end-pair.ps1") -PairId $limited.pair_id -Delete | Out-Null }
+        Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-InterruptedTurnRecovery {
+    $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("co-review-interrupted-" + [System.Guid]::NewGuid().ToString("N"))
+    $fakeCodex = New-FakeCodex -Directory $tempRoot
+    $pair = $null
+    try {
+        $pair = (& (Join-Path $Scripts "new-pair.ps1") -NoSpawn -Task "interrupted recovery" -CodexBin $fakeCodex -CodexModel configured-default -CodexReasoning auto | Select-Object -Last 1) | ConvertFrom-Json
+        $request = @{id="msg-0001";ts=(Get-Date).ToString("o");from="claude";type="request";content="do not replay"} | ConvertTo-Json -Compress
+        [System.IO.File]::WriteAllText((Join-Path $pair.pair_dir "to-codex.jsonl"), $request + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
+        $active = @{message_id="msg-0001";listener_pid=999998;process_pid=999999;started_at=(Get-Date).AddMinutes(-1).ToString("o");timeout_sec=300} | ConvertTo-Json
+        [System.IO.File]::WriteAllText((Join-Path $pair.pair_dir "active-turn.json"), $active, [System.Text.UTF8Encoding]::new($false))
+
+        $listener = Start-Process powershell.exe -ArgumentList @(
+            "-NoProfile", "-File", (Join-Path $Scripts "codex-listener.ps1"), "-PairId", $pair.pair_id,
+            "-CodexBin", $fakeCodex, "-PollIntervalSec", "1", "-DryRun"
+        ) -WindowStyle Hidden -PassThru
+        Wait-ForListener -PairDir $pair.pair_dir
+        $deadline = (Get-Date).AddSeconds(10)
+        $reply = $null
+        while ($null -eq $reply -and (Get-Date) -lt $deadline) {
+            $line = Get-Content -LiteralPath (Join-Path $pair.pair_dir "to-claude.jsonl") -ErrorAction SilentlyContinue | Select-Object -Last 1
+            if ($line) { $reply = $line | ConvertFrom-Json }
+            if ($null -eq $reply) { Start-Sleep -Milliseconds 100 }
+        }
+        $state = Get-Content -LiteralPath (Join-Path $pair.pair_dir "state.json") -Raw | ConvertFrom-Json
+        Assert-True ($reply.type -eq "error" -and $reply.error -match "interrupted") "restart should report an interrupted turn"
+        Assert-True ($state.last_processed -eq "msg-0001") "restart should advance past an interrupted turn instead of replaying it"
+    } finally {
+        if ($null -ne $pair -and (Test-Path -LiteralPath $pair.pair_dir)) { & (Join-Path $Scripts "end-pair.ps1") -PairId $pair.pair_id -Delete | Out-Null }
+        Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-ProgressUpdates {
+    $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("co-review-progress-" + [System.Guid]::NewGuid().ToString("N"))
+    $fakeCodex = New-FakeCodex -Directory $tempRoot -SleepMs 2500
+    $oldProgress = $env:CO_REVIEW_TEST_PROGRESS
+    $env:CO_REVIEW_TEST_PROGRESS = "high-confidence finding; continuing verification"
+    $pair = $null
+    try {
+        $pair = (& (Join-Path $Scripts "new-pair.ps1") -NoSpawn -Task "progress" -CodexBin $fakeCodex -CodexModel configured-default -CodexReasoning auto -MaxProgressUpdates 2 -ProgressMinIntervalSec 0 | Select-Object -Last 1) | ConvertFrom-Json
+        $listener = Start-Process powershell.exe -ArgumentList @("-NoProfile", "-File", (Join-Path $Scripts "codex-listener.ps1"), "-PairId", $pair.pair_id, "-CodexBin", $fakeCodex, "-PollIntervalSec", "1") -WindowStyle Hidden -PassThru
+        Wait-ForListener -PairDir $pair.pair_dir
+        $messageId = & (Join-Path $Scripts "send-worker.ps1") -WorkerId $pair.pair_id -Message "emit progress" | Select-Object -Last 1
+        $deadline = (Get-Date).AddSeconds(10)
+        $progress = $null
+        while ($null -eq $progress -and (Get-Date) -lt $deadline) {
+            foreach ($line in @(Get-Content -LiteralPath (Join-Path $pair.pair_dir "to-claude.jsonl") -ErrorAction SilentlyContinue)) {
+                try { $candidate = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+                if ($candidate.in_reply_to -eq $messageId -and $candidate.type -eq "progress") { $progress = $candidate; break }
+            }
+            if ($null -eq $progress) { Start-Sleep -Milliseconds 100 }
+        }
+        Assert-True ($progress.content -match "high-confidence") "listener should stream explicitly marked progress"
+        $busySend = Invoke-ScriptExpectFailure -ScriptName "send-worker.ps1" -ScriptArgs @("-WorkerId",$pair.pair_id,"-Message","must remain busy")
+        Assert-True ($busySend.ExitCode -ne 0 -and $busySend.Output -match "busy|queued") "progress must not count as a terminal reply"
+        $rawProgressRead = @(& (Join-Path $Scripts "recv-worker.ps1") -WorkerId $pair.pair_id -InReplyTo $messageId -IncludeProgress)
+        $progressRead = @($rawProgressRead | ForEach-Object { $_ | ConvertFrom-Json }) | Where-Object { $_.type -eq "progress" } | Select-Object -First 1
+        Assert-True ($null -ne $progressRead -and $progressRead.type -eq "progress") "recv-worker should expose progress on request (raw=$($rawProgressRead -join '|'))"
+        $final = & (Join-Path $Scripts "recv-worker.ps1") -WorkerId $pair.pair_id -InReplyTo $messageId -Wait -UntilFinal -TimeoutSec 20 -PollIntervalSec 1 | Select-Object -Last 1 | ConvertFrom-Json
+        Assert-True ($final.type -eq "response" -and $final.content -eq "fake codex reply") "recv-worker should wait for a terminal reply without confusing progress"
+    } finally {
+        $env:CO_REVIEW_TEST_PROGRESS = $oldProgress
+        if ($null -ne $pair -and (Test-Path -LiteralPath $pair.pair_dir)) { & (Join-Path $Scripts "end-pair.ps1") -PairId $pair.pair_id -Delete | Out-Null }
+        Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-ConcurrencyCap {
+    . (Join-Path $Scripts "common.ps1")
+    $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("co-review-fanout-" + [System.Guid]::NewGuid().ToString("N"))
+    $fakeCodex = New-FakeCodex -Directory $tempRoot
+    $workers = @()
+    try {
+        $limit = (Get-CoReviewActiveWorkerCount) + 2
+        foreach ($name in @("cap-one", "cap-two")) {
+            $worker = (& (Join-Path $Scripts "new-worker.ps1") -Name $name -Mode review -Task "cap" -ProjectCwd $RepoRoot -CodexBin $fakeCodex -Model configured-default -Reasoning auto -DryRunListener -WindowMode Hidden -MaxConcurrentWorkers $limit | Select-Object -Last 1) | ConvertFrom-Json
+            $workers += $worker
+        }
+        $blocked = Invoke-ScriptExpectFailure -ScriptName "new-worker.ps1" -ScriptArgs @("-Name","cap-three","-Mode","review","-Task","cap","-ProjectCwd",$RepoRoot,"-CodexBin",$fakeCodex,"-Model","configured-default","-Reasoning","auto","-DryRunListener","-WindowMode","Hidden","-MaxConcurrentWorkers",[string]$limit)
+        Assert-True ($blocked.ExitCode -ne 0 -and $blocked.Output -match "worker limit") "new-worker should enforce the defaultable concurrency cap"
+        $override = (& (Join-Path $Scripts "new-worker.ps1") -Name "cap-explicit" -Mode review -Task "cap" -ProjectCwd $RepoRoot -CodexBin $fakeCodex -Model configured-default -Reasoning auto -DryRunListener -WindowMode Hidden -MaxConcurrentWorkers $limit -AllowHighFanout | Select-Object -Last 1) | ConvertFrom-Json
+        $workers += $override
+        Assert-True ($override.worker_id -match '^pair-') "AllowHighFanout should permit explicit fan-out"
+    } finally {
+        foreach ($worker in $workers) { if (Test-Path -LiteralPath $worker.pair_dir) { & (Join-Path $Scripts "end-worker.ps1") -WorkerId $worker.worker_id -Delete | Out-Null } }
+        Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Test-BackwardCompatibility {
@@ -847,6 +1033,10 @@ $TestGroups = [ordered]@{
     WriterLeases = { Test-WriterLeases }
     WorktreeIsolation = { Test-WorktreeIsolation }
     SkillCommandContracts = { Test-SkillCommandContracts }
+    LatencyControls = { Test-LatencyControls }
+    InterruptedTurnRecovery = { Test-InterruptedTurnRecovery }
+    ProgressUpdates = { Test-ProgressUpdates }
+    ConcurrencyCap = { Test-ConcurrencyCap }
     BackwardCompatibility = { Test-BackwardCompatibility }
 }
 

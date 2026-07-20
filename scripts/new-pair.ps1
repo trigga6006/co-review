@@ -7,8 +7,11 @@ param(
     [string]$CodexModel = "gpt-5.5",
     [string]$CodexReasoning = "medium",
     [int]$CodexTimeoutSec = 1800,
+    [ValidateRange(0, 1000)][int]$MaxTurns = 0,
+    [ValidateRange(0, 10)][int]$MaxProgressUpdates = 0,
+    [ValidateRange(0, 3600)][int]$ProgressMinIntervalSec = 30,
     [ValidateSet("Minimized", "Hidden", "Foreground")][string]$WindowMode = "Minimized",
-    [ValidateSet("review", "workhorse")][string]$Mode = "review",
+    [ValidateSet("review", "workhorse", "imagegen")][string]$Mode = "review",
     [string]$WorkerName = "",
     [ValidateSet("auto", "shared", "worktree")][string]$Isolation = "shared",
     [ValidateSet("", "read-only", "workspace-write", "danger-full-access")][string]$Sandbox = "",
@@ -40,8 +43,9 @@ if ([string]::IsNullOrWhiteSpace($CodexBin)) {
 Assert-ValidCodexBin -CodexBin $CodexBin
 Assert-SafeCodexConfigOverrides -Overrides $ConfigOverride
 
-if ([string]::IsNullOrWhiteSpace($Sandbox)) { $Sandbox = if ($Mode -eq "workhorse") { "workspace-write" } else { "read-only" } }
+if ([string]::IsNullOrWhiteSpace($Sandbox)) { $Sandbox = if ($Mode -eq "review") { "read-only" } else { "workspace-write" } }
 if ($Mode -eq "review" -and $Sandbox -ne "read-only") { throw "Review workers must use the read-only sandbox" }
+if ($Mode -eq "imagegen" -and $Sandbox -eq "read-only") { throw "Imagegen workers require a writable sandbox" }
 if ($Sandbox -eq "danger-full-access" -and -not $ConfirmDangerFullAccess) { throw "danger-full-access requires -ConfirmDangerFullAccess" }
 if ($Mode -eq "review" -and $Isolation -eq "worktree") { throw "Review workers do not need worktree isolation" }
 
@@ -69,7 +73,7 @@ $lease = $null
 $managedWorktree = $null
 
 try {
-    if ($Mode -eq "workhorse") {
+    if ($Mode -in @("workhorse", "imagegen")) {
         if ($Isolation -eq "worktree") {
             $managedWorktree = New-CoReviewManagedWorktree -PairId $pairId -SourcePath $sourceProjectCwd -AllowDirtyBase:$AllowDirtyBase
             $actualProjectCwd = [string]$managedWorktree.worktree_path
@@ -86,7 +90,7 @@ try {
             } else {
                 $gitInfo = Get-CoReviewGitInfo -Path $sourceProjectCwd
                 if ($gitInfo.dirty -and -not $AllowDirtyBase) {
-                    throw "Source repository has uncommitted changes; automatic parallel worktree isolation is unsafe. Serialize the workhorse or commit/stash the changes first."
+                    throw "Source repository has uncommitted changes; automatic parallel writer isolation is unsafe. Serialize the writable worker or commit/stash the changes first."
                 }
                 $managedWorktree = New-CoReviewManagedWorktree -PairId $pairId -SourcePath $sourceProjectCwd -AllowDirtyBase:$AllowDirtyBase
                 $actualProjectCwd = [string]$managedWorktree.worktree_path
@@ -123,6 +127,9 @@ try {
         add_dirs = @($resolvedAddDirs)
         search_enabled = [bool]$Search
         codex_timeout_sec = $CodexTimeoutSec
+        max_turns = $MaxTurns
+        max_progress_updates = $MaxProgressUpdates
+        progress_min_interval_sec = $ProgressMinIntervalSec
         window_mode = $WindowMode
         dry_run_listener = [bool]$DryRunListener
         worktree_path = if ($null -ne $managedWorktree) { [string]$managedWorktree.worktree_path } else { "" }
@@ -163,6 +170,10 @@ try {
         codex_bin = $CodexBin
         codex_model = $CodexModel
         codex_reasoning = $CodexReasoning
+        codex_timeout_sec = $CodexTimeoutSec
+        max_turns = $MaxTurns
+        max_progress_updates = $MaxProgressUpdates
+        progress_min_interval_sec = $ProgressMinIntervalSec
         mode = $Mode
         sandbox = $Sandbox
         isolation = $resolvedIsolation

@@ -6,7 +6,10 @@ param(
     [string]$Since = "",
     [switch]$Wait,
     [int]$TimeoutSec = 600,
-    [int]$PollIntervalSec = 2
+    [int]$PollIntervalSec = 2,
+    [string]$InReplyTo = "",
+    [switch]$IncludeProgress,
+    [switch]$UntilFinal
 )
 
 $ErrorActionPreference = "Stop"
@@ -44,9 +47,15 @@ $deadline = (Get-Date).AddSeconds($TimeoutSec)
 
 while ($true) {
     $new = @(Read-NewMessages -File $toClaude -SinceId $Since)
-    if ($new.Count -gt 0) {
+    if (-not [string]::IsNullOrWhiteSpace($InReplyTo)) { $new = @($new | Where-Object { [string]($_.in_reply_to) -eq $InReplyTo }) }
+    $terminal = @($new | Where-Object { [string]($_.type) -in @("response", "error") })
+    $visible = @()
+    if ($IncludeProgress.IsPresent) { $visible = @($new) } else { $visible = @($terminal) }
+    $ready = $visible.Count -gt 0
+    if ($UntilFinal.IsPresent) { $ready = $terminal.Count -gt 0 }
+    if ($ready) {
         # Output as JSON, one message per line so callers can grep easily
-        foreach ($m in $new) {
+        foreach ($m in $visible) {
             $line = $m | ConvertTo-Json -Compress -Depth 10
             Write-Output $line
         }
