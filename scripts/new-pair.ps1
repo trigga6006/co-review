@@ -142,11 +142,15 @@ try {
     $spawned = $false
     $spawnDetail = "no-spawn (caller passed -NoSpawn)"
     $listenerPid = $null
+    $listenerStdoutLog = ""
+    $listenerStderrLog = ""
     if (-not $NoSpawn) {
         $started = Start-CoReviewListener -PairId $pairId -PairDir $pairDir -WindowMode $WindowMode
         $spawned = $true
         $spawnDetail = [string]$started.spawn_detail
         $listenerPid = $started.listener_pid
+        $listenerStdoutLog = [string]$started.listener_stdout_log
+        $listenerStderrLog = [string]$started.listener_stderr_log
     }
 
     Write-Host "[co-review] Created worker: $WorkerName ($pairId)"
@@ -167,6 +171,8 @@ try {
         window_spawned = $spawned
         spawn_detail = $spawnDetail
         listener_pid = $listenerPid
+        listener_stdout_log = $listenerStdoutLog
+        listener_stderr_log = $listenerStderrLog
         codex_bin = $CodexBin
         codex_model = $CodexModel
         codex_reasoning = $CodexReasoning

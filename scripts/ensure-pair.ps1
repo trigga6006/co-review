@@ -20,7 +20,7 @@ $result = Invoke-WithCoReviewMutex -Name $mutexName -ScriptBlock {
         Remove-Item -LiteralPath (Join-Path $pairDir "listener.pid") -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath (Join-Path $pairDir "shutdown") -Force -ErrorAction SilentlyContinue
         $started = Start-CoReviewListener -PairId $PairId -PairDir $pairDir -WindowMode ([string]$meta.window_mode)
-        return [PSCustomObject]@{ worker_id=$PairId; pair_id=$PairId; status="active"; restarted=$true; listener_pid=$started.listener_pid; pair_dir=$pairDir }
+        return [PSCustomObject]@{ worker_id=$PairId; pair_id=$PairId; status="active"; restarted=$true; listener_pid=$started.listener_pid; pair_dir=$pairDir; listener_stdout_log=$started.listener_stdout_log; listener_stderr_log=$started.listener_stderr_log }
     } catch {
         if ($leaseAcquired) { Release-WriterLease -PairId $PairId -WorkingDirectory ([string]$meta.project_cwd) }
         throw

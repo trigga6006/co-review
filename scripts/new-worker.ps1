@@ -6,8 +6,8 @@ param(
     [string]$Task = "",
     [string]$ProjectCwd = "",
     [string]$CodexBin = "",
-    [Alias("CodexModel")][string]$Model = "auto",
-    [Alias("CodexReasoning")][string]$Reasoning = "auto",
+    [Alias("CodexModel")][string]$Model = "role-default",
+    [Alias("CodexReasoning")][string]$Reasoning = "role-default",
     [ValidateSet("auto", "shared", "worktree")][string]$Isolation = "auto",
     [ValidateSet("", "read-only", "workspace-write", "danger-full-access")][string]$Sandbox = "",
     [ValidateSet("Hidden", "Minimized", "Foreground")][string]$WindowMode = "Hidden",
@@ -37,11 +37,11 @@ if ([string]::IsNullOrWhiteSpace($CodexBin)) {
 }
 Assert-ValidCodexBin -CodexBin $CodexBin
 $capabilities = Get-CodexCapabilities -CodexBin $CodexBin
-$selection = Resolve-CodexSelection -Capabilities $capabilities -Model $Model -Reasoning $Reasoning -AllowUnknownModel:$AllowUnknownModel
+$selection = Resolve-CoReviewRoleSelection -Capabilities $capabilities -Mode $Mode -Model $Model -Reasoning $Reasoning -AllowUnknownModel:$AllowUnknownModel
 
 $params = @{
     WorkerName = $Name; Mode = $Mode; Task = $Task; ProjectCwd = $ProjectCwd; CodexBin = $CodexBin
-    CodexModel = $Model; CodexReasoning = $Reasoning; Isolation = $Isolation; Sandbox = $Sandbox
+    CodexModel = $selection.model; CodexReasoning = $selection.reasoning; Isolation = $Isolation; Sandbox = $Sandbox
     WindowMode = $WindowMode; CodexTimeoutSec = $TimeoutSec; MaxTurns = $MaxTurns; MaxProgressUpdates = $MaxProgressUpdates
     ProgressMinIntervalSec = $ProgressMinIntervalSec; Profile = $Profile; AddDir = $AddDir
     ConfigOverride = $ConfigOverride; Search = $Search; AllowDirtyBase = $AllowDirtyBase

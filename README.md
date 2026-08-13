@@ -2,7 +2,7 @@
 
 **Let Claude Code orchestrate OpenAI Codex as reviewers, workhorse sub-agents, and image-generation specialists.**
 
-`co-review` gives Claude a latency-bounded local worker manager around the Codex CLI. The default workflow keeps Claude on the critical path and uses Codex for one focused cross-family check. Full implementation is delegated only when you explicitly request a Codex workhorse, while image requests use a dedicated mode that invokes Codex's installed `$imagegen` skill.
+`co-review` gives Claude a latency-bounded local worker manager around the Codex CLI. A bare co-review request for coding now uses a dedicated pair: GPT-5.6-Luna at high reasoning implements and verifies the change, then GPT-5.6-Sol at high reasoning reviews the stable result. Review-only, workhorse-only, and image requests remain explicit paths; image requests invoke Codex's installed `$imagegen` skill.
 
 Claude remains the sole orchestrator. Codex workers are leaf agents and cannot create an uncontrolled agent mesh.
 
@@ -28,7 +28,7 @@ User
 
 Each worker has a directory under `~/.cc-codex-pairs/` containing a JSONL inbox/outbox, metadata, logs, and its persisted Codex thread ID. A hidden PowerShell listener watches the queue and invokes `codex exec`/`codex exec resume` with the worker's fixed permissions.
 
-The PowerShell process is a background worker host, not the interactive Codex TUI. Use `-WindowMode Minimized` or `Foreground` when you want to see its log console.
+The PowerShell process is a background worker host, not the interactive Codex TUI. Hidden listeners detach stdout/stderr into per-worker log files so the launch does not appear as a failed Claude tool use. Use `-WindowMode Minimized` or `Foreground` when you want to see its log console.
 
 ## Install
 
@@ -56,14 +56,15 @@ Get-ChildItem "$env:USERPROFILE\.claude\skills\co-review" -Recurse | Unblock-Fil
 
 Tell Claude what role Codex should play:
 
-- “Use Codex to review this auth refactor with the strongest available model.”
+- “Use co-review on this parser change.” (one Luna workhorse, then one Sol reviewer)
+- “Use Codex to review this auth refactor.” (review-only)
 - “Use Codex as a workhorse sub-agent to implement this parser and run its tests.”
 - “Use Codex image generation to create a cinematic hero image and save it under assets.”
 - “Have two Codex workers handle the API and UI tasks in parallel.”
 - “Use Codex-Spark at xhigh reasoning for this focused change.”
 - “Ask Codex for a security review, but keep it read-only.”
 
-Claude reads `SKILL.md`, discovers live capabilities, chooses or honors your requested configuration, dispatches workers, and reviews their results. New workers default to five-minute turns, two total turns, up to two meaningful progress updates, and a four-worker global concurrency cap; extreme reasoning levels are never selected automatically.
+Claude reads `SKILL.md`, discovers live capabilities, chooses or honors your requested configuration, dispatches workers, and reviews their results. The default count is exactly one workhorse and one reviewer; explicit counts override it. New workers default to five-minute turns, two total turns, up to two meaningful progress updates, and a four-worker global concurrency cap. Luna may move to xhigh for genuinely complex implementation work; max and ultra are never selected automatically.
 
 ## Commands
 
@@ -89,9 +90,7 @@ $reviewer = & "$coReview\new-worker.ps1" `
   -Name "auth-review" `
   -Mode review `
   -Task "Review the auth refactor" `
-  -ProjectCwd (Get-Location).Path `
-  -Model "gpt-5.5" `
-  -Reasoning high | Select-Object -Last 1 | ConvertFrom-Json
+  -ProjectCwd (Get-Location).Path | Select-Object -Last 1 | ConvertFrom-Json
 ```
 
 ### Start a workhorse
@@ -102,8 +101,6 @@ $worker = & "$coReview\new-worker.ps1" `
   -Mode workhorse `
   -Task "Implement and test the parser" `
   -ProjectCwd (Get-Location).Path `
-  -Model "gpt-5.5" `
-  -Reasoning medium `
   -Isolation auto | Select-Object -Last 1 | ConvertFrom-Json
 ```
 
@@ -117,8 +114,6 @@ $imageWorker = & "$coReview\new-worker.ps1" `
   -Mode imagegen `
   -Task 'Generate the requested hero image with the $imagegen skill' `
   -ProjectCwd (Get-Location).Path `
-  -Model "gpt-5.5" `
-  -Reasoning low `
   -TimeoutSec 600 | Select-Object -Last 1 | ConvertFrom-Json
 
 & "$coReview\ask-worker.ps1" `
@@ -167,7 +162,7 @@ $messageId = & "$coReview\send-worker.ps1" -WorkerId $worker.worker_id -Message 
 
 `new-worker.ps1` supports:
 
-- `-Model <slug|auto|configured-default>` and `-Reasoning <level|auto>`
+- `-Model <slug|role-default|auto|configured-default>` and `-Reasoning <level|role-default|auto>`; `role-default` is Luna/high for workhorse and Sol/high for review
 - `-AllowUnknownModel` for an explicit undiscovered slug
 - `-Isolation auto|shared|worktree`
 - `-AllowDirtyBase` when a committed-HEAD-only isolated worker is intentional

@@ -299,6 +299,57 @@ function Resolve-CodexSelection {
     }
 }
 
+function Resolve-CoReviewRoleSelection {
+    param(
+        [Parameter(Mandatory=$true)]$Capabilities,
+        [Parameter(Mandatory=$true)][ValidateSet("review", "workhorse", "imagegen")][string]$Mode,
+        [string]$Model = "role-default",
+        [string]$Reasoning = "role-default",
+        [switch]$AllowUnknownModel
+    )
+
+    $requestedModel = $Model
+    $requestedReasoning = $Reasoning
+    $roleModels = @{
+        review = "gpt-5.6-sol"
+        workhorse = "gpt-5.6-luna"
+    }
+
+    if ($Model -eq "role-default") {
+        $preferredModel = [string]$roleModels[$Mode]
+        $preferredAvailable = -not [string]::IsNullOrWhiteSpace($preferredModel) -and
+            $null -ne ($Capabilities.models | Where-Object { $_.slug -eq $preferredModel -and $_.visibility -eq "list" } | Select-Object -First 1)
+        if ($Capabilities.cache_stale -eq $true) {
+            $Model = "configured-default"
+        } elseif ($preferredAvailable) {
+            $Model = $preferredModel
+        } else {
+            $Model = "auto"
+        }
+    }
+
+    if ($Reasoning -eq "role-default") {
+        if ($Mode -eq "imagegen") {
+            $Reasoning = "auto"
+        } elseif ($Model -eq "configured-default") {
+            $Reasoning = "auto"
+        } else {
+            $candidate = if ($Model -eq "auto") {
+                $Capabilities.models | Where-Object { $_.visibility -eq "list" } | Sort-Object -Property priority, slug | Select-Object -First 1
+            } else {
+                $Capabilities.models | Where-Object { $_.slug -eq $Model } | Select-Object -First 1
+            }
+            $supported = @($candidate.supported_reasoning_levels | ForEach-Object { [string]$_.effort })
+            $Reasoning = if ($supported -contains "high") { "high" } else { "auto" }
+        }
+    }
+
+    $selection = Resolve-CodexSelection -Capabilities $Capabilities -Model $Model -Reasoning $Reasoning -AllowUnknownModel:$AllowUnknownModel
+    if ($requestedModel -eq "role-default") { $selection.model_source = "role-default" }
+    if ($requestedReasoning -eq "role-default") { $selection.reasoning_source = "role-default" }
+    return $selection
+}
+
 function Assert-SafeCodexConfigOverrides {
     param([string[]]$Overrides = @())
     $reserved = @('model','model_reasoning_effort','sandbox_mode','approval_policy','cwd','output_last_message','features.multi_agent')
@@ -588,24 +639,54 @@ function Start-CoReviewListener {
     $arguments = @("-NoProfile", "-File", $listenerPath, "-PairId", $PairId, "-CodexBin", [string]$meta.codex_bin)
     if ($meta.dry_run_listener -eq $true) { $arguments += "-DryRun" }
     $argumentString = ($arguments | ForEach-Object { ConvertTo-CoReviewCommandLineArgument -Value $_ }) -join " "
-    $process = Start-Process -FilePath "powershell.exe" -ArgumentList $argumentString -WorkingDirectory $projectCwd -WindowStyle $processWindowStyle -PassThru -ErrorAction Stop
+    $listenerStdoutLog = ""
+    $listenerStderrLog = ""
+    $startParams = @{
+        FilePath = "powershell.exe"
+        ArgumentList = $argumentString
+        WorkingDirectory = $projectCwd
+        WindowStyle = $processWindowStyle
+        PassThru = $true
+        ErrorAction = "Stop"
+    }
+    if ($WindowMode -eq "Hidden") {
+        # A hidden listener must not inherit Claude Code's tool stdout/stderr
+        # handles. Inherited background handles can make a successful tool use
+        # appear as an error after the foreground creation command has returned.
+        $listenerStdoutLog = Join-Path $PairDir "listener.stdout.log"
+        $listenerStderrLog = Join-Path $PairDir "listener.stderr.log"
+        $startParams.RedirectStandardOutput = $listenerStdoutLog
+        $startParams.RedirectStandardError = $listenerStderrLog
+    }
+    $process = Start-Process @startParams
 
     $listenerPid = $null
     $deadline = (Get-Date).AddSeconds($StartupWaitSec)
     while ((Get-Date) -lt $deadline) {
         if (Test-CoReviewListenerAlive -PairDir $PairDir -ListenerPid ([ref]$listenerPid)) { break }
-        if ($process.HasExited) { throw "Listener process exited during startup for $PairId" }
+        if ($process.HasExited) {
+            $process.Dispose()
+            throw "Listener process exited during startup for $PairId"
+        }
         Start-Sleep -Milliseconds 200
     }
     if (-not (Test-CoReviewListenerAlive -PairDir $PairDir -ListenerPid ([ref]$listenerPid))) {
         if (-not $process.HasExited) { Stop-CoReviewProcessTree -ProcessId $process.Id }
+        $process.Dispose()
         throw "Listener did not report a validated PID within ${StartupWaitSec}s for $PairId"
     }
+    $processId = $process.Id
+    # Start-Process keeps the redirect file handles on its Process object.
+    # Release the parent-side handles now; disposing the wrapper does not stop
+    # the independently running listener.
+    $process.Dispose()
     return [PSCustomObject]@{
         spawned = $true
-        spawn_detail = "powershell ($WindowMode)"
+        spawn_detail = if ($WindowMode -eq "Hidden") { "powershell (Hidden, detached logs)" } else { "powershell ($WindowMode)" }
         listener_pid = $listenerPid
-        process_id = $process.Id
+        process_id = $processId
+        listener_stdout_log = $listenerStdoutLog
+        listener_stderr_log = $listenerStderrLog
     }
 }
 

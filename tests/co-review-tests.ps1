@@ -547,6 +547,29 @@ function Test-CapabilityDiscovery {
     $xhigh = Resolve-CodexSelection -Capabilities $capabilities -Model "gpt-test-frontier" -Reasoning "xhigh"
     Assert-True ($xhigh.reasoning -eq "xhigh") "frontier model should accept advertised xhigh reasoning"
 
+    $roleCapabilities = [PSCustomObject]@{
+        cache_stale = $false
+        models = @(
+            [PSCustomObject]@{
+                slug = "gpt-5.6-sol"; priority = 1; visibility = "list"; default_reasoning_level = "low"
+                supported_reasoning_levels = @([PSCustomObject]@{ effort="low" }, [PSCustomObject]@{ effort="high" })
+            },
+            [PSCustomObject]@{
+                slug = "gpt-5.6-luna"; priority = 2; visibility = "list"; default_reasoning_level = "medium"
+                supported_reasoning_levels = @([PSCustomObject]@{ effort="medium" }, [PSCustomObject]@{ effort="high" }, [PSCustomObject]@{ effort="xhigh" })
+            }
+        )
+    }
+    $reviewRole = Resolve-CoReviewRoleSelection -Capabilities $roleCapabilities -Mode review
+    Assert-True ($reviewRole.model -eq "gpt-5.6-sol" -and $reviewRole.reasoning -eq "high") "review role defaults should select Sol at high reasoning"
+    $workhorseRole = Resolve-CoReviewRoleSelection -Capabilities $roleCapabilities -Mode workhorse
+    Assert-True ($workhorseRole.model -eq "gpt-5.6-luna" -and $workhorseRole.reasoning -eq "high") "workhorse role defaults should select Luna at high reasoning"
+    $explicitRole = Resolve-CoReviewRoleSelection -Capabilities $roleCapabilities -Mode workhorse -Model "gpt-5.6-sol" -Reasoning low
+    Assert-True ($explicitRole.model -eq "gpt-5.6-sol" -and $explicitRole.reasoning -eq "low") "explicit role selections should override defaults"
+    $roleCapabilities.cache_stale = $true
+    $staleRole = Resolve-CoReviewRoleSelection -Capabilities $roleCapabilities -Mode review
+    Assert-True ($staleRole.model -eq "configured-default" -and $staleRole.reasoning -eq "auto") "stale caches should make role defaults defer to configured Codex defaults"
+
     $unsupportedRejected = $false
     try {
         Resolve-CodexSelection -Capabilities $capabilities -Model "gpt-test-fast" -Reasoning "medium" | Out-Null
@@ -596,11 +619,12 @@ function Test-WorkerLifecycle {
         try { Start-CoReviewListener -PairId $startupWorker.worker_id -PairDir $startupWorker.pair_dir -WindowMode Hidden -StartupWaitSec 0 | Out-Null } catch { $startupRejected = $true }
         Assert-True $startupRejected "listener startup should fail instead of returning a null validated PID"
         foreach ($name in @("review-security", "review-performance")) {
-            $json = & (Join-Path $Scripts "new-worker.ps1") -Name $name -Mode review -Task "review task" -ProjectCwd $RepoRoot -Model gpt-test-frontier -Reasoning medium -CodexBin $fakeCodex -DryRunListener | Select-Object -Last 1
+            $json = & (Join-Path $Scripts "new-worker.ps1") -Name $name -Mode review -Task "review task" -ProjectCwd $RepoRoot -Model gpt-test-frontier -Reasoning medium -CodexBin $fakeCodex -DryRunListener -AllowHighFanout | Select-Object -Last 1
             $worker = $json | ConvertFrom-Json
             $workers += $worker
             Assert-True ($worker.worker_id -eq $worker.pair_id) "worker output should retain the compatible pair id"
             Wait-ForListener -PairDir $worker.pair_dir
+            Assert-True ((Test-Path -LiteralPath $worker.listener_stdout_log) -and (Test-Path -LiteralPath $worker.listener_stderr_log)) "hidden listeners should detach stdout and stderr into worker log files"
         }
         Assert-True ($workers[0].worker_id -ne $workers[1].worker_id) "workers should have distinct ids"
         $reply = & (Join-Path $Scripts "ask-worker.ps1") -WorkerId $workers[0].worker_id -Message "hello worker" -TimeoutSec 20 -RawJson | Select-Object -Last 1 | ConvertFrom-Json
@@ -610,7 +634,7 @@ function Test-WorkerLifecycle {
         $fileReply = & (Join-Path $Scripts "ask-worker.ps1") -WorkerId $workers[0].worker_id -MessageFile $messageFile -TimeoutSec 20 -RawJson | Select-Object -Last 1 | ConvertFrom-Json
         Assert-True ($fileReply.content -match "hello from message file") "ask-worker MessageFile should route file content"
 
-        $spaceJson = & (Join-Path $Scripts "new-worker.ps1") -Name "review-spaces" -Mode review -Task "path quoting" -ProjectCwd $projectWithSpaces -Model gpt-test-frontier -Reasoning medium -CodexBin $fakeCodex -DryRunListener | Select-Object -Last 1
+        $spaceJson = & (Join-Path $Scripts "new-worker.ps1") -Name "review-spaces" -Mode review -Task "path quoting" -ProjectCwd $projectWithSpaces -Model gpt-test-frontier -Reasoning medium -CodexBin $fakeCodex -DryRunListener -AllowHighFanout | Select-Object -Last 1
         $spaceWorker = $spaceJson | ConvertFrom-Json
         $workers += $spaceWorker
         Wait-ForListener -PairDir $spaceWorker.pair_dir
@@ -763,9 +787,9 @@ function Test-WorktreeIsolation {
     $first = $null
     $second = $null
     try {
-        $first = (& (Join-Path $Scripts "new-worker.ps1") -Name writer-primary -Mode workhorse -Task "primary" -ProjectCwd $project -Isolation auto -Model gpt-test-frontier -Reasoning medium -CodexBin $fakeCodex -DryRunListener | Select-Object -Last 1) | ConvertFrom-Json
+        $first = (& (Join-Path $Scripts "new-worker.ps1") -Name writer-primary -Mode workhorse -Task "primary" -ProjectCwd $project -Isolation auto -Model gpt-test-frontier -Reasoning medium -CodexBin $fakeCodex -DryRunListener -AllowHighFanout | Select-Object -Last 1) | ConvertFrom-Json
         Wait-ForListener -PairDir $first.pair_dir
-        $second = (& (Join-Path $Scripts "new-worker.ps1") -Name writer-isolated -Mode workhorse -Task "isolated" -ProjectCwd $project -Isolation auto -Model gpt-test-frontier -Reasoning medium -CodexBin $fakeCodex -DryRunListener | Select-Object -Last 1) | ConvertFrom-Json
+        $second = (& (Join-Path $Scripts "new-worker.ps1") -Name writer-isolated -Mode workhorse -Task "isolated" -ProjectCwd $project -Isolation auto -Model gpt-test-frontier -Reasoning medium -CodexBin $fakeCodex -DryRunListener -AllowHighFanout | Select-Object -Last 1) | ConvertFrom-Json
         Wait-ForListener -PairDir $second.pair_dir
         Assert-True ($first.project_cwd -eq $project) "first automatic workhorse should use the source checkout"
         Assert-True ($second.project_cwd -ne $project) "second automatic workhorse should use an isolated worktree"
@@ -775,7 +799,7 @@ function Test-WorktreeIsolation {
         Assert-True (-not [string]::IsNullOrWhiteSpace([string]$secondMeta.worktree_branch)) "isolated metadata should record a branch"
 
         Set-Content -LiteralPath (Join-Path $project "tracked.txt") -Value "dirty" -Encoding ASCII
-        $dirty = Invoke-ScriptExpectFailure -ScriptName "new-worker.ps1" -ScriptArgs @("-Name","writer-dirty","-Mode","workhorse","-Task","dirty","-ProjectCwd",$project,"-Isolation","auto","-Model","gpt-test-frontier","-Reasoning","medium","-CodexBin",$fakeCodex,"-DryRunListener")
+        $dirty = Invoke-ScriptExpectFailure -ScriptName "new-worker.ps1" -ScriptArgs @("-Name","writer-dirty","-Mode","workhorse","-Task","dirty","-ProjectCwd",$project,"-Isolation","auto","-Model","gpt-test-frontier","-Reasoning","medium","-CodexBin",$fakeCodex,"-DryRunListener","-AllowHighFanout")
         Assert-True ($dirty.ExitCode -ne 0) "parallel auto isolation should reject a dirty source"
         Assert-True ($dirty.Output -match "uncommitted|dirty") "dirty-source rejection should be actionable"
         Assert-True ((Get-Content -LiteralPath (Join-Path $project "tracked.txt") -Raw).Trim() -eq "dirty") "failed isolation must preserve source changes"
@@ -801,7 +825,8 @@ function Test-SkillCommandContracts {
     Assert-True ($skill -match "cache_stale" -and $skill -match "configured-default") "skill should teach Claude to avoid automatic selection from a stale cache"
     Assert-True ($skill -match "Claude.*sole orchestrator") "SKILL.md should keep Claude as sole orchestrator"
     Assert-True ($skill -match "two total turns|two turns" -and $skill -match "300-second|300 seconds") "SKILL.md should bound default latency and turn count"
-    Assert-True ($skill -match "Never select.*xhigh.*automatically") "SKILL.md should prohibit automatic extreme reasoning"
+    Assert-True ($skill -match "gpt-5\.6-luna" -and $skill -match "gpt-5\.6-sol" -and $skill -match "exactly one workhorse and one reviewer") "SKILL.md should define the default Luna plus Sol pair"
+    Assert-True ($skill -match "xhigh.*Luna|Luna.*xhigh" -and $skill -match 'Never select `max` or `ultra` automatically') "SKILL.md should bound automatic deep reasoning"
     Assert-True ($skill -match "cancel.*timeout|timeout.*cancel") "SKILL.md should cancel hidden work after wait timeout"
     Assert-True ($skill -match "progress updates" -and $skill -match "IncludeProgress" -and $skill -match "UntilFinal") "SKILL.md should teach bounded progress polling"
     Assert-True ($skill -match "four live workers" -and $skill -match "AllowHighFanout") "SKILL.md should document the fan-out cap"
