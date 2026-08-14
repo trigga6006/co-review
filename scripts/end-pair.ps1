@@ -15,14 +15,12 @@ Invoke-WithCoReviewMutex -Name $mutexName -ScriptBlock {
     $meta = Get-NormalizedPairMetadata -PairDir $pairDir
 
     [System.IO.File]::WriteAllText((Join-Path $pairDir "shutdown"), "", [System.Text.UTF8Encoding]::new($false))
+    Signal-CoReviewChannel -PairId $PairId -Channel "inbox"
     $activePath = Join-Path $pairDir "active-turn.json"
     if (Test-Path -LiteralPath $activePath -PathType Leaf) {
         try {
             $active = Get-Content -LiteralPath $activePath -Raw | ConvertFrom-Json
-            [int]$activePid = 0
-            if ([int]::TryParse([string]$active.process_pid, [ref]$activePid) -and $activePid -gt 0) {
-                Stop-CoReviewProcessTree -ProcessId $activePid
-            }
+            & (Join-Path $PSScriptRoot "cancel-worker.ps1") -WorkerId $PairId -MessageId ([string]$active.message_id) -Json | Out-Null
         } catch {
             Write-Warning "Could not stop active Codex turn cleanly: $($_.Exception.Message)"
         }

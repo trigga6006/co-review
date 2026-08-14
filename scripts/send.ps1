@@ -61,32 +61,21 @@ try {
     }
 
     if (-not $Queue) {
-        $repliedTo = @{}
-        $toClaude = Join-Path -Path $pairDir -ChildPath "to-claude.jsonl"
-        if (Test-Path -LiteralPath $toClaude -PathType Leaf) {
-            foreach ($line in @(Get-Content -LiteralPath $toClaude -Encoding UTF8 -ErrorAction SilentlyContinue)) {
-                try { $replyObj = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
-                if ([string]$replyObj.type -in @("response", "error") -and -not [string]::IsNullOrWhiteSpace([string]$replyObj.in_reply_to)) { $repliedTo[[string]$replyObj.in_reply_to] = $true }
-            }
+        $sentCount = Get-CoReviewSequence -PairDir $pairDir -Channel "inbox" -FallbackQueuePath $toCodex
+        $completedCount = 0
+        $statePath = Join-Path $pairDir "state.json"
+        if (Test-Path -LiteralPath $statePath -PathType Leaf) {
+            try {
+                $queueState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -ErrorAction Stop
+                if ($null -ne $queueState.PSObject.Properties["completed_turns"]) { $completedCount = [long]$queueState.completed_turns }
+            } catch {}
         }
-        $pending = @()
-        if (Test-Path -LiteralPath $toCodex -PathType Leaf) {
-            foreach ($line in @(Get-Content -LiteralPath $toCodex -Encoding UTF8 -ErrorAction SilentlyContinue)) {
-                try { $requestObj = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
-                if (-not $repliedTo.ContainsKey([string]$requestObj.id)) { $pending += [string]$requestObj.id }
-            }
-        }
-        if ($pending.Count -gt 0) {
-            throw "Worker $PairId is busy or already queued ($($pending -join ', ')). Wait/cancel it, or pass -Queue to enqueue intentionally."
+        if ($sentCount -gt $completedCount) {
+            throw "Worker $PairId is busy or already queued ($($sentCount - $completedCount) pending). Wait/cancel it, or pass -Queue to enqueue intentionally."
         }
     }
 
-    # Derive next id from existing line count under lock.
-    $cnt = 0
-    if (Test-Path $toCodex) {
-        $cnt = @(Get-Content $toCodex -ErrorAction SilentlyContinue | Where-Object { $_ -and $_.Trim() -ne "" }).Count
-    }
-    $cnt++
+    $cnt = Get-NextCoReviewSequence -PairId $PairId -PairDir $pairDir -Channel "inbox" -FallbackQueuePath $toCodex
     $msgId = "msg-{0:D4}" -f $cnt
 
     $msgObj = @{
@@ -101,7 +90,8 @@ try {
     if ($TurnTimeoutSec -gt 0) { $msgObj.turn_timeout_sec = $TurnTimeoutSec }
     $msg = $msgObj | ConvertTo-Json -Compress -Depth 10
 
-    Add-Content -Path $toCodex -Value $msg -Encoding UTF8
+    [System.IO.File]::AppendAllText($toCodex, ($msg + [Environment]::NewLine), [System.Text.UTF8Encoding]::new($false))
+    Signal-CoReviewChannel -PairId $PairId -Channel "inbox"
 } finally {
     if ($locked) { $mutex.ReleaseMutex() | Out-Null }
     $mutex.Dispose()

@@ -1,6 +1,6 @@
 ---
 name: co-review
-description: Use when the user asks Claude to use co-review/Codex/GPT as a coding copilot, workhorse, reviewer, second opinion, or raster image generator/editor. Defaults coding tasks to a coordinated Luna workhorse plus Sol reviewer, while preserving dedicated workhorse, review-only, and imagegen paths; live capability checks; persistent leaf workers; safe writer isolation; cancellation; and explicit worker counts.
+description: Use when the user asks Claude to use co-review/Codex/GPT as a coding copilot, workhorse, reviewer, second opinion, or raster image generator/editor. Defaults coding tasks to a coordinated Luna workhorse plus Sol reviewer and can scale through light, medium, high, and xhigh fan-out tiers; preserves dedicated workhorse, review-only, and imagegen paths, live capability checks, safe writer isolation, cancellation, and explicit worker counts.
 ---
 
 # Co-review: fast cross-family checks for Claude Code
@@ -11,7 +11,7 @@ Claude is the sole orchestrator. Codex processes are leaf workers and must not s
 
 Optimize for finishing the user's task. Keep Claude as the sole orchestrator and keep every Codex process a dedicated leaf worker.
 
-When the user says only "use co-review," "use Codex," or similar for a coding task, run the default copilot pair:
+When the user says only "use co-review," "use Codex," or similar for a coding task, select the lowest fan-out tier justified by independent workstreams. Use Light by default:
 
 1. One `workhorse` using `gpt-5.6-luna` at `high` reasoning implements and verifies the bounded change.
 2. One separate `review` worker using `gpt-5.6-sol` at `high` reasoning reviews the resulting diff and test evidence.
@@ -50,9 +50,32 @@ New workers default to a 300-second process timeout, two total turns, and at mos
 
 Explicit user choices for model, reasoning, mode, isolation, search, sandbox, or visibility always win. Never silently widen permissions.
 
-### Worker counts
+### Fan-out tiers
 
-Default to exactly one workhorse and one reviewer. Treat requests such as "two workhorses" or "three reviewers" as exact counts while leaving the unspecified role at one. Use multiple workhorses only for independent writable scopes and isolate them with managed worktrees; never have two writers edit the same checkout. Give multiple reviewers distinct concerns rather than duplicate prompts. Do not infer extra workers merely because a task is large. The normal global cap remains four live workers; exceeding it requires an explicit user request.
+Treat these as orchestration profiles, not model reasoning levels:
+
+| Tier | Workhorses | Reviewers | Select when |
+|---|---:|---:|---|
+| Light | 1 | 1 | One focused implementation scope; default for ordinary changes |
+| Medium | 2 | 1 | Two genuinely independent implementation scopes |
+| High | 5 | 2 | Broad multi-area work with three to five independent scopes and an integration plan |
+| XHigh | 10 | 3 | Repo-wide or product-wide work with six to ten independent scopes and explicit integration ownership |
+
+Fable/Claude normally chooses the tier. Select the lowest tier that fits the decomposition; task difficulty alone does not justify more workers. After selecting a tier, use its exact target allocation. If fewer independent scopes exist, choose a lower tier instead of inventing redundant assignments. Give every workhorse a mutually exclusive writable scope and every reviewer a distinct concern. Final review begins only after the relevant artifacts are stable.
+
+Explicit user counts or a named tier always win. Requests such as "seven workhorses and five reviewers" are exact. For workhorse-only or review-only requests, use only the requested role and the selected tier's count for that role. Image generation stays separate; scale imagegen only when the user requests multiple independent images or edits.
+
+Use managed worktrees for parallel workhorses; never have two writers edit the same checkout. The normal global live-worker soft cap is 32, large enough for an XHigh team plus other sessions. If an automatic tier would exceed 32, reuse/stop idle workers or choose a lower tier. Exceed 32 with `-AllowHighFanout` only for an explicit user count.
+
+After defining mutually exclusive scopes, launch independent `new-worker.ps1` calls concurrently. Capacity reservations are atomic but listener startup is not globally serialized. Do not create ten workers sequentially when their setup has no dependency; preserve sequential creation only when a later worker's scope or checkout depends on an earlier result.
+
+Different Claude conversations may use co-review simultaneously. At the start of each conversation, generate one owner token and pass it to every worker created by that conversation:
+
+```powershell
+$coReviewOwner = "claude-" + [guid]::NewGuid().ToString("N").Substring(0, 16)
+```
+
+Retain that literal token in the conversation. Filter status with `list-workers.ps1 -OwnerId $coReviewOwner`. Never reuse, cancel, stop, or follow up with a worker owned by another Claude conversation merely because it appears idle in the global list.
 
 Select `imagegen` for new raster artwork, illustrations, concept images, photo-style assets, and edits to existing images. Keep diagrams, charts, SVGs, and code-rendered graphics in the normal Claude workflow unless the user explicitly wants generative image output. Image generation benefits from tool time, not extreme reasoning; normally use the visible model default with `low` or its advertised default reasoning and a 600-second turn timeout.
 
@@ -67,6 +90,8 @@ $coReview = "$env:USERPROFILE\.claude\skills\co-review\scripts"
 If installed elsewhere, resolve this skill directory and use its `scripts` child.
 
 Hidden listeners redirect their process stdout and stderr to `listener.stdout.log` and `listener.stderr.log` inside the worker directory. This prevents a successful background listener from retaining Claude Code's foreground tool handles and appearing as a tool error. Inspect those files only when listener startup or recovery actually fails.
+
+The default `auto` transport keeps JSONL as a durable journal but wakes readers through per-worker named events. It connects each worker to an independent Codex thread on one shared local app-server broker, avoiding per-turn CLI startup. If app-server is unavailable it falls back first to a dedicated persistent stdio server and then to legacy `codex exec`. `-Profile`, `-Search`, or `-ConfigOverride` currently select the legacy transport automatically; pass `-Transport legacy` explicitly only when troubleshooting compatibility.
 
 ## Workflow
 
@@ -85,17 +110,18 @@ Run only when capabilities are not fresh in the conversation:
 ```powershell
 $caps = & "$coReview\get-capabilities.ps1" -Json | ConvertFrom-Json
 $caps.models | Select-Object slug, display_name, default_reasoning_level, supported_reasoning_levels
+$caps.fanout_tiers | Select-Object name, workhorses, reviewers, description
 ```
 
-`new-worker.ps1` applies role defaults automatically: Luna/high for `workhorse` and Sol/high for `review`. It first verifies those slugs against the live cache. If a role model is unavailable, it falls back to the highest-priority visible model; if `cache_stale` is true, it uses `configured-default` with `auto` reasoning. Honor any explicit user selection. Use `-Reasoning xhigh` for Luna only under the Deep work rule.
+`new-worker.ps1` applies role defaults automatically: Luna/high for `workhorse` and Sol/high for `review`. It first verifies those slugs against the live cache. If a role model is unavailable, it falls back to the highest-priority visible model; if `cache_stale` is true, it uses `configured-default` with `auto` reasoning. Honor any explicit user selection. Use `-Reasoning xhigh` for Luna only under the Deep work rule. Do not infer model reasoning from the fan-out tier: an XHigh team still uses Luna/high unless a worker independently meets the Deep work rule.
 
 ### 3. Inspect status before reuse
 
 ```powershell
-$workers = & "$coReview\list-workers.ps1" -Json | ConvertFrom-Json
+$workers = & "$coReview\list-workers.ps1" -OwnerId $coReviewOwner -Json | ConvertFrom-Json
 ```
 
-Reuse only an `idle` worker whose project, mode, sandbox, and narrow responsibility match. Never send to a `busy` worker. `queue_depth`, `active_message_id`, and `active_elapsed_sec` show hidden work. Sending refuses an occupied worker unless `-Queue` is explicitly supplied; intentional queueing should be rare.
+Reuse only an `idle` worker owned by this Claude conversation whose project, mode, sandbox, and narrow responsibility match. Never send to a `busy` or foreign-owned worker. `queue_depth`, `active_message_id`, and `active_elapsed_sec` show hidden work. Sending refuses an occupied worker unless `-Queue` is explicitly supplied; intentional queueing should be rare.
 
 ### 4. Dispatch without creating dead time
 
@@ -125,7 +151,7 @@ Use the synchronous path only when the reply genuinely gates the next action. Ke
 
 By default, a synchronous wait timeout cancels the Codex turn so it cannot keep consuming time invisibly. Use `-LeaveRunning` only when the user wants background continuation.
 
-Progress messages contain only explicitly marked, high-confidence findings; they do not make a worker idle or complete a turn. Poll them at natural checkpoints rather than continuously. Use the last returned message `id` with `-Since` to avoid rereading updates.
+Progress messages contain only explicitly marked, high-confidence findings; they do not make a worker idle or complete a turn. Read them at natural checkpoints rather than continuously. Queue wakeups are event-driven, and readers tail only new JSONL records. Use the last returned message `id` with `-Since` when resuming a reader in a new process.
 
 ### 5. Decide once, then stop
 
@@ -146,12 +172,14 @@ Omitting `-Model` and `-Reasoning` deliberately selects the role defaults. Creat
 ```powershell
 $luna = & "$coReview\new-worker.ps1" `
   -Name "parser-change" -Mode workhorse `
+  -OwnerId $coReviewOwner `
   -Task "Implement only the parser change and run focused tests" `
   -ProjectCwd (Get-Location).Path `
   -Isolation auto -TimeoutSec 300 -MaxTurns 2 | Select-Object -Last 1 | ConvertFrom-Json
 
 $sol = & "$coReview\new-worker.ps1" `
   -Name "parser-review" -Mode review `
+  -OwnerId $coReviewOwner `
   -Task "Review Luna's completed parser change" `
   -ProjectCwd $luna.project_cwd `
   -TimeoutSec 300 -MaxTurns 1 | Select-Object -Last 1 | ConvertFrom-Json
@@ -176,6 +204,7 @@ Use a dedicated image worker even though it writes an output file:
 ```powershell
 $imageWorker = & "$coReview\new-worker.ps1" `
   -Name "hero-art" -Mode imagegen `
+  -OwnerId $coReviewOwner `
   -Task 'Generate the requested hero image with the $imagegen skill' `
   -ProjectCwd (Get-Location).Path `
   -Isolation auto -TimeoutSec 600 -MaxTurns 2 | Select-Object -Last 1 | ConvertFrom-Json
@@ -196,7 +225,7 @@ The `imagegen` initialization envelope independently tells Codex that image gene
 & "$coReview\end-worker.ps1" -WorkerId $worker.worker_id
 ```
 
-`cancel-worker.ps1` stops the active Codex process without killing the listener; pass `-MessageId` to cancel a queued turn. `ensure-worker.ps1` restarts a dead listener while preserving the thread and queue. An interrupted active turn is returned as an error and is never replayed automatically, which prevents duplicate writes.
+`cancel-worker.ps1` interrupts the active Codex turn without killing the listener; pass `-MessageId` to cancel a queued turn. `ensure-worker.ps1` restarts a dead listener while preserving the thread and queue. An interrupted active turn is returned as an error and is never replayed automatically, which prevents duplicate writes.
 
 ## Guardrails
 
@@ -205,9 +234,10 @@ The `imagegen` initialization envelope independently tells Codex that image gene
 - Parallel writers use separate managed Git worktrees and never auto-merge.
 - Automatic worktree isolation refuses a dirty source repository unless the user accepts `-AllowDirtyBase` committed-HEAD-only context.
 - Use `danger-full-access` only when explicitly requested and pass `-ConfirmDangerFullAccess`.
-- Do not ask workers to spawn agents. The listener forces `features.multi_agent=false`.
+- Do not ask workers to spawn agents. The leaf-worker envelope prohibits delegation; legacy execution additionally forces `features.multi_agent=false`.
 - New workers allow two turns by default. Use `-MaxTurns 0` only when the user explicitly wants an open-ended persistent worker.
-- Allow at most four live workers by default. Beyond four, require an explicit user request and pass `-AllowHighFanout`. Each `new-worker.ps1` call creates one leaf Codex process; never enable nested Codex agents.
+- Allow at most 32 live workers by default. Beyond 32, require an explicit user count and pass `-AllowHighFanout`. Each `new-worker.ps1` call creates one independently addressed leaf Codex thread; never enable nested Codex agents.
+- Give every Claude conversation a unique `-OwnerId`. Treat foreign-owned workers as out of scope even though the global registry makes their capacity visible.
 - Keep progress at the default two meaningful updates per turn. Set `-MaxProgressUpdates 0` to disable it.
 - `-Queue` and `-LeaveRunning` are explicit escape hatches, not normal workflow.
 
@@ -219,7 +249,7 @@ The `imagegen` initialization envelope independently tells Codex that image gene
 | `new-worker.ps1` | Start a bounded review/workhorse worker |
 | `ask-worker.ps1` | Send one task and wait; cancel on wait timeout by default |
 | `send-worker.ps1` | Queue one task without blocking; refuses busy workers |
-| `recv-worker.ps1` | Poll progress or wait for the correlated final reply |
+| `recv-worker.ps1` | Read progress or wait for the correlated final reply |
 | `list-workers.ps1` | Show `idle`/`busy`, elapsed time, queue, thread, and lease state |
 | `cancel-worker.ps1` | Cancel an active or queued turn |
 | `ensure-worker.ps1` | Verify/restart a listener without replaying interrupted work |

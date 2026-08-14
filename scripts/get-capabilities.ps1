@@ -42,4 +42,12 @@ $modeTable = @(
     [PSCustomObject]@{ mode = "imagegen"; sandbox = "workspace-write" }
 ) | Format-Table -AutoSize | Out-String
 Write-Output $modeTable.TrimEnd()
-Write-Output "Default selection: model=$($capabilities.defaults.model), reasoning=$($capabilities.defaults.reasoning), isolation=$($capabilities.defaults.isolation), window=$($capabilities.defaults.window_mode)"
+Write-Output ""
+Write-Output "Fan-out tiers:"
+$fanoutTable = $capabilities.fanout_tiers |
+    Select-Object name, workhorses, reviewers, description |
+    Format-Table -AutoSize -Wrap |
+    Out-String
+Write-Output $fanoutTable.TrimEnd()
+Write-Output "Default selection: model=$($capabilities.defaults.model), reasoning=$($capabilities.defaults.reasoning), isolation=$($capabilities.defaults.isolation), window=$($capabilities.defaults.window_mode), fanout=$($capabilities.defaults.fanout_tier), transport=$($capabilities.defaults.transport)"
+Write-Output "Global live-worker soft cap: $($capabilities.global_worker_soft_cap)"

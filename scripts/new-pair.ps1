@@ -11,6 +11,8 @@ param(
     [ValidateRange(0, 10)][int]$MaxProgressUpdates = 0,
     [ValidateRange(0, 3600)][int]$ProgressMinIntervalSec = 30,
     [ValidateSet("Minimized", "Hidden", "Foreground")][string]$WindowMode = "Minimized",
+    [ValidateSet("auto", "app-server", "legacy")][string]$Transport = "auto",
+    [ValidatePattern('^$|^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$')][string]$OwnerId = "",
     [ValidateSet("review", "workhorse", "imagegen")][string]$Mode = "review",
     [string]$WorkerName = "",
     [ValidateSet("auto", "shared", "worktree")][string]$Isolation = "shared",
@@ -60,9 +62,10 @@ $CodexModel = [string]$selection.model
 $CodexReasoning = [string]$selection.reasoning
 
 $timestamp = (Get-Date).ToString("yyyyMMdd-HHmmss")
-$randHex = -join ((1..4) | ForEach-Object { "{0:x}" -f (Get-Random -Maximum 16) })
+$randHex = [guid]::NewGuid().ToString("N").Substring(0, 12)
 $pairId = "pair-$timestamp-$randHex"
 if ([string]::IsNullOrWhiteSpace($WorkerName)) { $WorkerName = $pairId }
+if ([string]::IsNullOrWhiteSpace($OwnerId)) { $OwnerId = "owner-" + [guid]::NewGuid().ToString("N").Substring(0, 12) }
 
 $root = Get-CoReviewRoot
 $pairDir = Join-Path $root $pairId
@@ -102,13 +105,16 @@ try {
 
     [System.IO.File]::WriteAllText((Join-Path $pairDir "to-codex.jsonl"), "", [System.Text.UTF8Encoding]::new($false))
     [System.IO.File]::WriteAllText((Join-Path $pairDir "to-claude.jsonl"), "", [System.Text.UTF8Encoding]::new($false))
-    $state = @{ last_processed = $null; codex_session_id = $null; msg_counter = 0 } | ConvertTo-Json
+    [System.IO.File]::WriteAllText((Join-Path $pairDir ".inbox.seq"), "0", [System.Text.UTF8Encoding]::new($false))
+    [System.IO.File]::WriteAllText((Join-Path $pairDir ".outbox.seq"), "0", [System.Text.UTF8Encoding]::new($false))
+    $state = @{ last_processed = $null; codex_session_id = $null; codex_thread_id = $null; inbox_offset = 0; msg_counter = 0; completed_turns = 0 } | ConvertTo-Json
     [System.IO.File]::WriteAllText((Join-Path $pairDir "state.json"), $state, [System.Text.UTF8Encoding]::new($false))
 
     $meta = [ordered]@{
         schema_version = 2
         pair_id = $pairId
         worker_name = $WorkerName
+        owner_id = $OwnerId
         created_at = (Get-Date).ToString("o")
         source_project_cwd = $sourceProjectCwd
         project_cwd = $actualProjectCwd
@@ -130,6 +136,7 @@ try {
         max_turns = $MaxTurns
         max_progress_updates = $MaxProgressUpdates
         progress_min_interval_sec = $ProgressMinIntervalSec
+        transport = $Transport
         window_mode = $WindowMode
         dry_run_listener = [bool]$DryRunListener
         worktree_path = if ($null -ne $managedWorktree) { [string]$managedWorktree.worktree_path } else { "" }
@@ -165,6 +172,7 @@ try {
         pair_id = $pairId
         name = $WorkerName
         worker_name = $WorkerName
+        owner_id = $OwnerId
         pair_dir = $pairDir
         project_cwd = $actualProjectCwd
         source_project_cwd = $sourceProjectCwd
@@ -180,6 +188,7 @@ try {
         max_turns = $MaxTurns
         max_progress_updates = $MaxProgressUpdates
         progress_min_interval_sec = $ProgressMinIntervalSec
+        transport = $Transport
         mode = $Mode
         sandbox = $Sandbox
         isolation = $resolvedIsolation

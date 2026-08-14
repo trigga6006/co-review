@@ -1,7 +1,7 @@
 # co-review: codex-listener.ps1
-# Runs in a dedicated terminal window. Polls to-codex.jsonl for new messages
-# from Claude, runs `codex exec` (or `codex exec resume <id>` for follow-ups),
-# and appends responses to to-claude.jsonl.
+# Runs in a dedicated terminal window. Durable JSONL queues are awakened by
+# per-pair named events. By default turns use a persistent Codex app-server
+# connection, with the one-shot `codex exec` path retained as a fallback.
 [CmdletBinding()]
 param(
     [Parameter(Mandatory=$true)][string]$PairId,
@@ -15,6 +15,7 @@ param(
 
 $ErrorActionPreference = "Continue"
 . (Join-Path $PSScriptRoot "common.ps1")
+. (Join-Path $PSScriptRoot "app-server.ps1")
 $pairDir = Get-PairDir -PairId $PairId
 if (-not (Test-Path $pairDir)) {
     Write-Host "[co-review] FATAL: pair dir not found: $pairDir" -ForegroundColor Red
@@ -31,12 +32,16 @@ $pidFile   = Join-Path $pairDir "listener.pid"
 $activeTurnFile = Join-Path $pairDir "active-turn.json"
 $progressStateFile = Join-Path $pairDir "progress.json"
 $cancelDir = Join-Path $pairDir "cancelled"
+$inboxSignal = Open-CoReviewSignal -PairId $PairId -Channel "inbox"
+$script:appServerClient = $null
 
 # Write our PID so list-pairs can verify the listener is actually alive
 [System.IO.File]::WriteAllText($pidFile, $PID, [System.Text.UTF8Encoding]::new($false))
 # Ensure we clean up the pid file on exit (graceful or not - the trap covers Ctrl+C too)
 $cleanupPidFile = $pidFile
 trap {
+    try { Stop-CoReviewAppServerClient -Client $script:appServerClient } catch {}
+    try { $inboxSignal.Dispose() } catch {}
     Remove-Item -ErrorAction SilentlyContinue $cleanupPidFile
     continue
 }
@@ -74,12 +79,35 @@ $workerProfile = [string]$meta.profile
 $workerAddDirs = @($meta.add_dirs | ForEach-Object { [string]$_ })
 $workerSearch = ($meta.search_enabled -eq $true)
 $workerConfigOverrides = @($meta.config_overrides | ForEach-Object { [string]$_ })
+$requestedTransport = [string]$meta.transport
+if ($requestedTransport -notin @("auto", "app-server", "legacy")) { $requestedTransport = "auto" }
+$activeTransport = if ($requestedTransport -eq "legacy") { "legacy" } else { "app-server" }
+if ($activeTransport -eq "app-server" -and (-not [string]::IsNullOrWhiteSpace($workerProfile) -or $workerSearch -or $workerConfigOverrides.Count -gt 0)) {
+    if ($requestedTransport -eq "app-server") {
+        $metadataError = "The app-server transport does not yet support Profile, Search, or ConfigOverride worker options; use transport=legacy"
+    } else {
+        $activeTransport = "legacy"
+    }
+}
+if ($metadataError) {
+    Write-Host "[co-review] FATAL: $metadataError" -ForegroundColor Red
+    Remove-Item -ErrorAction SilentlyContinue $pidFile
+    exit 1
+}
 try {
     Assert-ValidCodexBin -CodexBin $CodexBin
     Assert-SafeCodexConfigOverrides -Overrides $workerConfigOverrides
 } catch {
     Write-Host "[co-review] FATAL: $($_.Exception.Message)" -ForegroundColor Red
     exit 1
+}
+if ($activeTransport -eq "app-server" -and -not (Test-CoReviewAppServerSupport -CodexBin $CodexBin)) {
+    if ($requestedTransport -eq "app-server") {
+        Write-Host "[co-review] FATAL: Codex CLI does not expose app-server support" -ForegroundColor Red
+        Remove-Item -ErrorAction SilentlyContinue $pidFile
+        exit 1
+    }
+    $activeTransport = "legacy"
 }
 
 # Header
@@ -95,6 +123,7 @@ Write-Host "  Task:        $($meta.task_hint)"
 Write-Host "  Worker mode: $workerMode ($workerSandbox)"
 Write-Host "  Codex bin:   $CodexBin"
 Write-Host "  Codex model: $CodexModel ($CodexReasoning reasoning)"
+Write-Host "  Transport:   $activeTransport (requested: $requestedTransport)"
 Write-Host "  Created:     $($meta.created_at)"
 if ($DryRun) { Write-Host "  Mode:        DRY RUN (echo only, no codex calls)" -ForegroundColor Yellow }
 Write-Host ""
@@ -116,9 +145,13 @@ function Write-Log {
 
 function Get-State {
     if (Test-Path $stateFile) {
-        return Get-Content $stateFile -Raw | ConvertFrom-Json
+        $loaded = Get-Content $stateFile -Raw | ConvertFrom-Json
+        if ($null -eq $loaded.PSObject.Properties['completed_turns']) { $loaded | Add-Member completed_turns 0 -Force }
+        if ($null -eq $loaded.PSObject.Properties['inbox_offset']) { $loaded | Add-Member inbox_offset 0 -Force }
+        if ($null -eq $loaded.PSObject.Properties['codex_thread_id']) { $loaded | Add-Member codex_thread_id $null -Force }
+        return $loaded
     }
-    return [PSCustomObject]@{ last_processed = $null; codex_session_id = $null; msg_counter = 0; completed_turns = 0 }
+    return [PSCustomObject]@{ last_processed = $null; codex_session_id = $null; codex_thread_id = $null; inbox_offset = 0; msg_counter = 0; completed_turns = 0 }
 }
 
 function Save-State {
@@ -129,12 +162,7 @@ function Save-State {
 
 function Append-Reply {
     param([string]$InReplyTo, [string]$Content, [string]$ErrMsg = "")
-    # Derive next id from line count in to-claude.jsonl (avoids state.json races)
-    $cnt = 0
-    if (Test-Path $toClaude) {
-        $cnt = @(Get-Content $toClaude -ErrorAction SilentlyContinue | Where-Object { $_ -and $_.Trim() -ne "" }).Count
-    }
-    $cnt++
+    $cnt = Get-NextCoReviewSequence -PairId $PairId -PairDir $pairDir -Channel "outbox" -FallbackQueuePath $toClaude
     $replyId = "cdx-{0:D4}" -f $cnt
     $obj = @{
         id = $replyId
@@ -146,26 +174,24 @@ function Append-Reply {
     }
     if ($ErrMsg) { $obj.error = $ErrMsg }
     $line = $obj | ConvertTo-Json -Compress -Depth 10
-    Add-Content -Path $toClaude -Value $line -Encoding UTF8
+    [System.IO.File]::AppendAllText($toClaude, ($line + [Environment]::NewLine), [System.Text.UTF8Encoding]::new($false))
+    Signal-CoReviewChannel -PairId $PairId -Channel "outbox"
     return $replyId
 }
 
 function Read-NewIncoming {
-    param([string]$LastId)
-    if (-not (Test-Path $toCodex)) { return @() }
-    $lines = Get-Content $toCodex -Encoding UTF8 -ErrorAction SilentlyContinue | Where-Object { $_ -and $_.Trim() -ne "" }
-    $msgs = @()
-    foreach ($line in $lines) {
-        try { $msgs += ($line | ConvertFrom-Json) } catch { }
+    param([string]$LastId, [long]$Offset = 0)
+    $tail = Read-CoReviewJsonlTail -Path $toCodex -Offset $Offset
+    $records = @($tail.records | Where-Object { $null -ne $_.value })
+    if ($Offset -eq 0 -and -not [string]::IsNullOrWhiteSpace($LastId)) {
+        $afterIdx = -1
+        for ($i = 0; $i -lt $records.Count; $i++) { if ([string]$records[$i].value.id -eq $LastId) { $afterIdx = $i; break } }
+        if ($afterIdx -ge 0) { $records = if ($afterIdx -lt ($records.Count - 1)) { @($records[($afterIdx + 1)..($records.Count - 1)]) } else { @() } }
     }
-    if ([string]::IsNullOrWhiteSpace($LastId)) { return $msgs }
-    $afterIdx = -1
-    for ($i = 0; $i -lt $msgs.Count; $i++) {
-        if ($msgs[$i].id -eq $LastId) { $afterIdx = $i; break }
+    foreach ($record in $records) {
+        $record.value | Add-Member -NotePropertyName _queue_end_offset -NotePropertyValue ([long]$record.end_offset) -Force
     }
-    if ($afterIdx -lt 0) { return $msgs }
-    if ($afterIdx -ge ($msgs.Count - 1)) { return @() }
-    return $msgs[($afterIdx + 1)..($msgs.Count - 1)]
+    return $records | ForEach-Object { $_.value }
 }
 
 function Format-CmdArg {
@@ -300,7 +326,7 @@ function Invoke-Codex {
         $stdoutPs = [powershell]::Create()
         $stdoutPs.Runspace = $stdoutRunspace
         [void]$stdoutPs.AddScript({
-            param($p, $eventPath, $outboxPath, $progressPath, $messageId, $maxUpdates, $minIntervalSec)
+            param($p, $eventPath, $outboxPath, $progressPath, $messageId, $maxUpdates, $minIntervalSec, $outboxSignalName)
             $utf8 = [System.Text.UTF8Encoding]::new($false)
             $count = 0
             $lastProgress = [DateTimeOffset]::MinValue
@@ -328,11 +354,16 @@ function Invoke-Codex {
                     content = $content
                 }
                 [System.IO.File]::AppendAllText($outboxPath, (($progress | ConvertTo-Json -Compress -Depth 10) + [Environment]::NewLine), $utf8)
+                try {
+                    $created = $false
+                    $outboxSignal = [System.Threading.EventWaitHandle]::new($false, [System.Threading.EventResetMode]::AutoReset, $outboxSignalName, [ref]$created)
+                    try { [void]$outboxSignal.Set() } finally { $outboxSignal.Dispose() }
+                } catch {}
                 $progressState = [ordered]@{ message_id=$messageId; count=$count; last_progress_at=$progress.ts; last_progress=$content }
                 [System.IO.File]::WriteAllText($progressPath, ($progressState | ConvertTo-Json -Depth 5), $utf8)
                 $lastProgress = $now
             }
-        }).AddArgument($proc).AddArgument($stdoutEventFile.FullName).AddArgument($toClaude).AddArgument($ProgressStateFile).AddArgument($MessageId).AddArgument($MaxProgressUpdates).AddArgument($ProgressMinIntervalSec)
+        }).AddArgument($proc).AddArgument($stdoutEventFile.FullName).AddArgument($toClaude).AddArgument($ProgressStateFile).AddArgument($MessageId).AddArgument($MaxProgressUpdates).AddArgument($ProgressMinIntervalSec).AddArgument((Get-CoReviewSignalName -PairId $PairId -Channel "outbox"))
         $stdoutHandle = $stdoutPs.BeginInvoke()
 
         $stderrRunspace = [runspacefactory]::CreateRunspace()
@@ -491,7 +522,7 @@ while ($true) {
     }
 
     $state = Get-State
-    $newMsgs = @(Read-NewIncoming -LastId $state.last_processed)
+    $newMsgs = @(Read-NewIncoming -LastId $state.last_processed -Offset ([long]$state.inbox_offset))
 
     foreach ($msg in $newMsgs) {
         Write-Host ""
@@ -502,6 +533,7 @@ while ($true) {
         Write-Log "Processing $($msg.id) (type=$($msg.type), $($msg.content.Length) chars)"
 
         $capturedSid = $null
+        $capturedThreadId = $null
         $cancelMarker = Join-Path $cancelDir ([string]$msg.id + ".cancel")
         $completedTurns = if ($null -ne $state.PSObject.Properties['completed_turns']) { [int]$state.completed_turns } else { 0 }
         $maxTurns = [int]$meta.max_turns
@@ -518,7 +550,6 @@ while ($true) {
             Write-Host "<<< Replied (dry run) as $rid" -ForegroundColor Magenta
         } else {
             try {
-                $sid = $state.codex_session_id
                 $effectiveModel = if ($msg.model) { [string]$msg.model } else { $CodexModel }
                 $effectiveReasoning = if ($msg.reasoning) { $msg.reasoning } else { $CodexReasoning }
                 $effectiveTimeout = if ($msg.turn_timeout_sec -gt 0) { [int]$msg.turn_timeout_sec } else { $CodexTimeoutSec }
@@ -533,20 +564,45 @@ while ($true) {
                     Write-Log "Reasoning override on $($msg.id): $effectiveReasoning"
                 }
                 $envelope = New-CodexTaskEnvelope -Meta $meta -Task ([string]$msg.content)
-                $result = Invoke-Codex -Prompt $envelope -SessionId $sid -Cwd $workDir -Model $effectiveModel -Reasoning $effectiveReasoning -Sandbox $workerSandbox -TimeoutSec $effectiveTimeout -Profile $workerProfile -AddDir $workerAddDirs -Search $workerSearch -ConfigOverrides $workerConfigOverrides -MessageId ([string]$msg.id) -ActiveTurnFile $activeTurnFile -ProgressStateFile $progressStateFile -MaxProgressUpdates ([int]$meta.max_progress_updates) -ProgressMinIntervalSec ([int]$meta.progress_min_interval_sec)
+                if ($activeTransport -eq "app-server") {
+                    if (-not (Test-CoReviewAppServerClientAlive -Client $script:appServerClient)) {
+                        try {
+                            $script:appServerClient = Start-CoReviewAppServerClient -CodexBin $CodexBin -WorkingDirectory $workDir -ConnectionMode "auto"
+                            Write-Log "Connected to Codex app-server ($($script:appServerClient.connection_mode))"
+                        } catch {
+                            if ($requestedTransport -eq "auto") {
+                                Write-Log "App-server unavailable; falling back to legacy transport: $($_.Exception.Message)"
+                                $activeTransport = "legacy"
+                            } else { throw }
+                        }
+                    }
+                }
+                if ($activeTransport -eq "app-server") {
+                    $threadId = [string]$state.codex_thread_id
+                    if ([string]::IsNullOrWhiteSpace($threadId)) {
+                        $threadId = Open-CoReviewAppServerThread -Client $script:appServerClient -WorkingDirectory $workDir -Sandbox $workerSandbox -Model $effectiveModel -WorkspaceRoots (@($workDir) + @($workerAddDirs))
+                        $capturedThreadId = $threadId
+                        Write-Host "    [co-review] Captured app-server thread id: $threadId" -ForegroundColor DarkCyan
+                        Write-Log "Captured app-server thread_id=$threadId"
+                    }
+                    $result = Invoke-CoReviewAppServerTurn -Client $script:appServerClient -PairId $PairId -ThreadId $threadId -Prompt $envelope -MessageId ([string]$msg.id) -WorkingDirectory $workDir -OutboxPath $toClaude -ActiveTurnFile $activeTurnFile -Model $effectiveModel -Reasoning $effectiveReasoning -TimeoutSec $effectiveTimeout -MaxProgressUpdates ([int]$meta.max_progress_updates) -ProgressMinIntervalSec ([int]$meta.progress_min_interval_sec)
+                } else {
+                    $sid = $state.codex_session_id
+                    $result = Invoke-Codex -Prompt $envelope -SessionId $sid -Cwd $workDir -Model $effectiveModel -Reasoning $effectiveReasoning -Sandbox $workerSandbox -TimeoutSec $effectiveTimeout -Profile $workerProfile -AddDir $workerAddDirs -Search $workerSearch -ConfigOverrides $workerConfigOverrides -MessageId ([string]$msg.id) -ActiveTurnFile $activeTurnFile -ProgressStateFile $progressStateFile -MaxProgressUpdates ([int]$meta.max_progress_updates) -ProgressMinIntervalSec ([int]$meta.progress_min_interval_sec)
+                }
 
                 if ($result.ExitCode -ne 0) {
                     $stderrText = [string]$result.Stderr
                     if ($stderrText.Length -gt 8000) { $stderrText = $stderrText.Substring(0, 8000) + "`n[stderr truncated]" }
                     $partialReply = [string]$result.Reply
                     if ($partialReply.Length -gt 4000) { $partialReply = $partialReply.Substring(0, 4000) + "`n[partial output truncated]" }
-                    $errText = "codex exec exit=$($result.ExitCode). stderr:`n$stderrText"
+                    $errText = "Codex turn exit=$($result.ExitCode). stderr:`n$stderrText"
                     if (-not [string]::IsNullOrWhiteSpace($partialReply)) { $errText += "`npartial output:`n$partialReply" }
                     Write-Host "    ERROR: $errText" -ForegroundColor Red
                     Write-Log "ERROR on $($msg.id): $errText"
                     $rid = Append-Reply -InReplyTo $msg.id -Content "" -ErrMsg $errText
                 } else {
-                    if ($result.SessionId -and -not $state.codex_session_id) {
+                    if ($activeTransport -eq "legacy" -and $result.SessionId -and -not $state.codex_session_id) {
                         $capturedSid = $result.SessionId
                         Write-Host "    [co-review] Captured codex session id: $capturedSid" -ForegroundColor DarkCyan
                         Write-Log "Captured session_id=$capturedSid"
@@ -563,23 +619,32 @@ while ($true) {
             }
         }
 
+        Remove-Item -LiteralPath $activeTurnFile -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $cancelMarker -Force -ErrorAction SilentlyContinue
 
         # One state save per message - load fresh, apply both updates, save once.
         # (Append-Reply doesn't touch state.json, so the only writer here is this block.)
         $state = Get-State
         $state.last_processed = $msg.id
+        $state | Add-Member -NotePropertyName inbox_offset -NotePropertyValue ([long]$msg._queue_end_offset) -Force
         $completed = if ($null -ne $state.PSObject.Properties['completed_turns']) { [int]$state.completed_turns } else { 0 }
         $state | Add-Member -NotePropertyName completed_turns -NotePropertyValue ($completed + 1) -Force
         if ($capturedSid) {
             $state | Add-Member -NotePropertyName codex_session_id -NotePropertyValue $capturedSid -Force
         }
+        if ($capturedThreadId) {
+            $state | Add-Member -NotePropertyName codex_thread_id -NotePropertyValue $capturedThreadId -Force
+        }
         Save-State $state
     }
 
-    Start-Sleep -Seconds $PollIntervalSec
+    if ($newMsgs.Count -eq 0) {
+        [void](Wait-CoReviewChannel -Signal $inboxSignal -TimeoutMilliseconds ([Math]::Max(50, $PollIntervalSec * 1000)))
+    }
 }
 
+Stop-CoReviewAppServerClient -Client $script:appServerClient
+$inboxSignal.Dispose()
 Remove-Item -ErrorAction SilentlyContinue $pidFile
 
 Write-Host ""

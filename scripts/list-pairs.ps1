@@ -1,6 +1,6 @@
 # List legacy pairs and schema-v2 workers.
 [CmdletBinding()]
-param([switch]$IncludeArchived, [switch]$Json)
+param([switch]$IncludeArchived, [switch]$Json, [string]$OwnerId = "")
 $ErrorActionPreference = "Continue"
 . (Join-Path $PSScriptRoot "common.ps1")
 $root = Get-CoReviewRoot
@@ -11,6 +11,7 @@ if (-not (Test-Path -LiteralPath $root)) {
 $results = @()
 foreach ($dir in @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "pair-*" })) {
     try { $meta = Get-NormalizedPairMetadata -PairDir $dir.FullName } catch { continue }
+    if (-not [string]::IsNullOrWhiteSpace($OwnerId) -and [string]$meta.owner_id -ne $OwnerId) { continue }
     try { $state = Get-Content -LiteralPath (Join-Path $dir.FullName "state.json") -Raw | ConvertFrom-Json } catch { $state = $null }
     $listenerPid = $null
     $alive = Test-CoReviewListenerAlive -PairDir $dir.FullName -ListenerPid ([ref]$listenerPid)
@@ -19,21 +20,18 @@ foreach ($dir in @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction Sile
     if (Test-Path -LiteralPath $activeTurnPath -PathType Leaf) {
         try { $activeTurn = Get-Content -LiteralPath $activeTurnPath -Raw | ConvertFrom-Json } catch { $activeTurn = $null }
     }
-    $repliedTo = @{}
-    $replyPath = Join-Path $dir.FullName "to-claude.jsonl"
-    if (Test-Path -LiteralPath $replyPath -PathType Leaf) {
-        foreach ($line in @(Get-Content -LiteralPath $replyPath -Encoding UTF8 -ErrorAction SilentlyContinue)) {
-            try { $replyObj = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
-            if ([string]$replyObj.type -in @("response", "error") -and -not [string]::IsNullOrWhiteSpace([string]$replyObj.in_reply_to)) { $repliedTo[[string]$replyObj.in_reply_to] = $true }
-        }
-    }
     $pendingIds = @()
     $requestPath = Join-Path $dir.FullName "to-codex.jsonl"
     if (Test-Path -LiteralPath $requestPath -PathType Leaf) {
-        foreach ($line in @(Get-Content -LiteralPath $requestPath -Encoding UTF8 -ErrorAction SilentlyContinue)) {
-            try { $requestObj = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
-            if (-not $repliedTo.ContainsKey([string]$requestObj.id)) { $pendingIds += [string]$requestObj.id }
+        $offset = if ($state -and $null -ne $state.PSObject.Properties['inbox_offset']) { [long]$state.inbox_offset } else { 0 }
+        $tail = Read-CoReviewJsonlTail -Path $requestPath -Offset $offset
+        $requests = @($tail.records | Where-Object { $null -ne $_.value } | ForEach-Object { $_.value })
+        if ($offset -eq 0 -and $state -and -not [string]::IsNullOrWhiteSpace([string]$state.last_processed)) {
+            $last = -1
+            for ($i = 0; $i -lt $requests.Count; $i++) { if ([string]$requests[$i].id -eq [string]$state.last_processed) { $last = $i; break } }
+            if ($last -ge 0) { $requests = if ($last -lt ($requests.Count - 1)) { @($requests[($last + 1)..($requests.Count - 1)]) } else { @() } }
         }
+        $pendingIds = @($requests | ForEach-Object { [string]$_.id })
     }
     $status = if (-not $alive) { "dead" } elseif (Test-Path -LiteralPath (Join-Path $dir.FullName "shutdown")) { "shutdown-pending" } elseif ($null -ne $activeTurn) { "busy" } else { "idle" }
     $activeElapsedSec = 0
@@ -59,11 +57,11 @@ foreach ($dir in @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction Sile
         if ($null -ne $file -and $file.LastWriteTimeUtc -gt [DateTime]::Parse($lastActivity).ToUniversalTime()) { $lastActivity = $file.LastWriteTimeUtc.ToString("o") }
     }
     $results += [PSCustomObject]@{
-        pair_id=$dir.Name; pair_dir=$dir.FullName; worker_name=[string]$meta.worker_name; schema_version=[int]$meta.schema_version
+        pair_id=$dir.Name; pair_dir=$dir.FullName; worker_name=[string]$meta.worker_name; owner_id=[string]$meta.owner_id; schema_version=[int]$meta.schema_version
         created_at=[string]$meta.created_at; project_cwd=[string]$meta.project_cwd; source_project_cwd=[string]$meta.source_project_cwd
         task_hint=[string]$meta.task_hint; mode=[string]$meta.mode; sandbox=[string]$meta.sandbox; isolation=[string]$meta.isolation
-        codex_model=[string]$meta.codex_model; codex_reasoning=[string]$meta.codex_reasoning; listener_pid=$listenerPid; status=$status
-        codex_session_id=if($state){[string]$state.codex_session_id}else{""}; writer_lease=$hasLease; last_activity=$lastActivity
+        codex_model=[string]$meta.codex_model; codex_reasoning=[string]$meta.codex_reasoning; transport=[string]$meta.transport; listener_pid=$listenerPid; status=$status
+        codex_session_id=if($state -and -not [string]::IsNullOrWhiteSpace([string]$state.codex_thread_id)){[string]$state.codex_thread_id}elseif($state){[string]$state.codex_session_id}else{""}; writer_lease=$hasLease; last_activity=$lastActivity
         active_message_id=if($activeTurn){[string]$activeTurn.message_id}else{""}; active_elapsed_sec=$activeElapsedSec
         queue_depth=$pendingIds.Count; pending_message_ids=@($pendingIds); completed_turns=if($state -and $null -ne $state.PSObject.Properties['completed_turns']){[int]$state.completed_turns}else{0}; max_turns=[int]$meta.max_turns
         progress_count=if($progress){[int]$progress.count}else{0}; last_progress_at=if($progress){[string]$progress.last_progress_at}else{""}; last_progress=if($progress){[string]$progress.last_progress}else{""}

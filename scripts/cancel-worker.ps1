@@ -7,6 +7,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "common.ps1")
+. (Join-Path $PSScriptRoot "app-server.ps1")
 
 $pairDir = Get-PairDir -PairId $WorkerId -MustExist
 $activePath = Join-Path $pairDir "active-turn.json"
@@ -28,12 +29,19 @@ New-Item -ItemType Directory -Path $cancelDir -Force | Out-Null
 
 $stopped = $false
 if ($null -ne $active -and [string]$active.message_id -eq $MessageId) {
-    [int]$processId = 0
-    if ([int]::TryParse([string]$active.process_pid, [ref]$processId) -and $processId -gt 0 -and $null -ne (Get-Process -Id $processId -ErrorAction SilentlyContinue)) {
-        Stop-CoReviewProcessTree -ProcessId $processId
+    if ([string]$active.backend -eq "app-server" -and [string]$active.connection_mode -eq "shared") {
+        $meta = Get-NormalizedPairMetadata -PairDir $pairDir
+        Interrupt-CoReviewAppServerTurn -CodexBin ([string]$active.codex_bin) -WorkingDirectory ([string]$meta.project_cwd) -ThreadId ([string]$active.thread_id) -TurnId ([string]$active.turn_id)
         $stopped = $true
+    } else {
+        [int]$processId = 0
+        if ([int]::TryParse([string]$active.process_pid, [ref]$processId) -and $processId -gt 0 -and $null -ne (Get-Process -Id $processId -ErrorAction SilentlyContinue)) {
+            Stop-CoReviewProcessTree -ProcessId $processId
+            $stopped = $true
+        }
     }
 }
+Signal-CoReviewChannel -PairId $WorkerId -Channel "inbox"
 
 $result = [PSCustomObject]@{
     worker_id = $WorkerId

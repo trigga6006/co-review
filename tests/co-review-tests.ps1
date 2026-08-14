@@ -29,24 +29,56 @@ function New-FakeCodex {
         [Parameter(Mandatory=$true)][string]$Directory,
         [int]$SleepMs = 0,
         [int]$ExitCode = 0,
-        [string]$Version = "0.999.0"
+        [string]$Version = "0.999.0",
+        [switch]$SupportsAppServer
     )
 
     New-Item -ItemType Directory -Path $Directory -Force | Out-Null
     $fakeCodex = Join-Path $Directory "codex.exe"
     $typeName = "FakeCodex_" + [System.Guid]::NewGuid().ToString("N")
+    $supportsAppServerLiteral = if ($SupportsAppServer) { "true" } else { "false" }
     $source = @"
 using System;
 using System.IO;
 using System.Text;
 using System.Threading;
+using System.Text.RegularExpressions;
 public static class $typeName {
+    private static readonly bool SupportsAppServer = $supportsAppServerLiteral;
     private static string JsonEscape(string value) {
         return value.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\r", "\\r").Replace("\n", "\\n");
     }
     public static int Main(string[] args) {
         if (args.Length == 1 && args[0] == "--version") {
             Console.WriteLine("codex-cli $Version-test");
+            return 0;
+        }
+
+        if (SupportsAppServer && args.Length >= 2 && args[0] == "app-server") {
+            if (Array.IndexOf(args, "--help") >= 0) {
+                Console.WriteLine("Run the app server. Transport endpoint: stdio or WebSocket.");
+                return 0;
+            }
+            if (Array.IndexOf(args, "--listen") >= 0) { return 2; }
+            string line;
+            while ((line = Console.ReadLine()) != null) {
+                Match match = Regex.Match(line, "\"id\"\\s*:\\s*(\\d+)");
+                string id = match.Success ? match.Groups[1].Value : "0";
+                if (line.Contains("\"method\":\"initialize\"")) {
+                    Console.WriteLine("{\"id\":" + id + ",\"result\":{\"codexHome\":\"fake\",\"platformFamily\":\"windows\",\"platformOs\":\"windows\",\"userAgent\":\"fake\"}}");
+                } else if (line.Contains("\"method\":\"thread/start\"") || line.Contains("\"method\":\"thread/resume\"")) {
+                    Console.WriteLine("{\"id\":" + id + ",\"result\":{\"thread\":{\"id\":\"fake-app-thread\"}}}");
+                } else if (line.Contains("\"method\":\"turn/start\"")) {
+                    Console.WriteLine("{\"id\":" + id + ",\"result\":{\"turn\":{\"id\":\"fake-app-turn\"}}}");
+                    Console.Out.Flush();
+                    Thread.Sleep($SleepMs);
+                    Console.WriteLine("{\"method\":\"item/completed\",\"params\":{\"threadId\":\"fake-app-thread\",\"turnId\":\"fake-app-turn\",\"completedAtMs\":1,\"item\":{\"id\":\"fake-message\",\"type\":\"agentMessage\",\"text\":\"fake app-server reply\"}}}");
+                    Console.WriteLine("{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"fake-app-thread\",\"turn\":{\"id\":\"fake-app-turn\",\"status\":\"completed\",\"items\":[]}}}");
+                } else if (line.Contains("\"method\":\"turn/interrupt\"")) {
+                    Console.WriteLine("{\"id\":" + id + ",\"result\":{}}");
+                }
+                Console.Out.Flush();
+            }
             return 0;
         }
 
@@ -470,12 +502,20 @@ function Test-CapabilityDiscovery {
     Assert-True ($humanOutput -match "gpt-test-frontier") "human output should include the frontier model"
     Assert-True ($humanOutput -match "gpt-test-fast") "human output should include the fast model"
     Assert-True ($humanOutput -notmatch "gpt-test-hidden") "human output should exclude hidden models"
+    Assert-True ($humanOutput -match "Fan-out tiers" -and $humanOutput -match "xhigh") "human output should include scalable fan-out tiers"
 
     $capabilities = Get-CodexCapabilities -ModelsCachePath $fixture
     $modelSlugs = @($capabilities.models | ForEach-Object { $_.slug })
     Assert-True ($modelSlugs -contains "gpt-test-frontier") "capabilities should include the frontier model"
     Assert-True ($modelSlugs -contains "gpt-test-fast") "capabilities should include the fast model"
     Assert-True ($modelSlugs -notcontains "gpt-test-hidden") "capabilities should exclude hidden models"
+    $fanoutTiers = @($capabilities.fanout_tiers)
+    Assert-True (($fanoutTiers.name -join ',') -eq "light,medium,high,xhigh") "capabilities should expose ordered fan-out tiers"
+    Assert-True ($fanoutTiers[0].workhorses -eq 1 -and $fanoutTiers[0].reviewers -eq 1) "light fan-out should use one workhorse and one reviewer"
+    Assert-True ($fanoutTiers[1].workhorses -eq 2 -and $fanoutTiers[1].reviewers -eq 1) "medium fan-out should use two workhorses and one reviewer"
+    Assert-True ($fanoutTiers[2].workhorses -eq 5 -and $fanoutTiers[2].reviewers -eq 2) "high fan-out should use five workhorses and two reviewers"
+    Assert-True ($fanoutTiers[3].workhorses -eq 10 -and $fanoutTiers[3].reviewers -eq 3) "xhigh fan-out should use ten workhorses and three reviewers"
+    Assert-True ($capabilities.defaults.fanout_tier -eq "light" -and $capabilities.global_worker_soft_cap -eq 32) "capabilities should advertise light default fan-out and the widened soft cap"
     $hiddenCapabilities = Get-CodexCapabilities -ModelsCachePath $fixture -IncludeHidden
     Assert-True (@($hiddenCapabilities.models | ForEach-Object { $_.slug }) -contains "gpt-test-hidden") "IncludeHidden should expose hidden models"
 
@@ -825,11 +865,14 @@ function Test-SkillCommandContracts {
     Assert-True ($skill -match "cache_stale" -and $skill -match "configured-default") "skill should teach Claude to avoid automatic selection from a stale cache"
     Assert-True ($skill -match "Claude.*sole orchestrator") "SKILL.md should keep Claude as sole orchestrator"
     Assert-True ($skill -match "two total turns|two turns" -and $skill -match "300-second|300 seconds") "SKILL.md should bound default latency and turn count"
-    Assert-True ($skill -match "gpt-5\.6-luna" -and $skill -match "gpt-5\.6-sol" -and $skill -match "exactly one workhorse and one reviewer") "SKILL.md should define the default Luna plus Sol pair"
+    Assert-True ($skill -match "gpt-5\.6-luna" -and $skill -match "gpt-5\.6-sol" -and $skill -match "Light by default") "SKILL.md should define the default Luna plus Sol light profile"
     Assert-True ($skill -match "xhigh.*Luna|Luna.*xhigh" -and $skill -match 'Never select `max` or `ultra` automatically') "SKILL.md should bound automatic deep reasoning"
     Assert-True ($skill -match "cancel.*timeout|timeout.*cancel") "SKILL.md should cancel hidden work after wait timeout"
     Assert-True ($skill -match "progress updates" -and $skill -match "IncludeProgress" -and $skill -match "UntilFinal") "SKILL.md should teach bounded progress polling"
-    Assert-True ($skill -match "four live workers" -and $skill -match "AllowHighFanout") "SKILL.md should document the fan-out cap"
+    Assert-True ($skill -match "Light.*1.*1" -and $skill -match "Medium.*2.*1" -and $skill -match "High.*5.*2" -and $skill -match "XHigh.*10.*3") "SKILL.md should document increasing fan-out tiers"
+    Assert-True ($skill -match "32 live workers" -and $skill -match "AllowHighFanout") "SKILL.md should document the widened fan-out cap"
+    $newWorker = Get-Content -LiteralPath (Join-Path $Scripts "new-worker.ps1") -Raw
+    Assert-True ($newWorker -match 'MaxConcurrentWorkers = 32') "new-worker should default to the widened 32-worker soft cap"
     Assert-True ($skill -match 'select `imagegen`' -and $skill -match "Do not claim otherwise based on stale product knowledge") "SKILL.md should select imagegen directly and reject stale capability assumptions"
     Assert-True ($skill -match "Actually call|actual image-generation tool call") "SKILL.md should require image generation rather than a prompt-only response"
     Assert-True ($skill -notmatch "Spawn at most one pair per Claude conversation") "obsolete one-pair restriction should be removed"
@@ -889,6 +932,39 @@ function Test-LatencyControls {
         Assert-True ($first.type -eq "response" -and $second.type -eq "error" -and $second.error -match "turn limit") "listener should enforce MaxTurns"
     } finally {
         if ($null -ne $limited -and (Test-Path -LiteralPath $limited.pair_dir)) { & (Join-Path $Scripts "end-pair.ps1") -PairId $limited.pair_id -Delete | Out-Null }
+        Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-EventDrivenAndAppServerTransport {
+    $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("co-review-transport-" + [System.Guid]::NewGuid().ToString("N"))
+    $fakeCodex = New-FakeCodex -Directory $tempRoot -SupportsAppServer
+    $ownerId = "claude-test-transport"
+    $appPair = $null
+    $eventPair = $null
+    try {
+        $appPair = (& (Join-Path $Scripts "new-pair.ps1") -NoSpawn -OwnerId $ownerId -Transport app-server -Task "app transport" -CodexBin $fakeCodex -CodexModel configured-default -CodexReasoning auto | Select-Object -Last 1) | ConvertFrom-Json
+        $appListener = Start-Process powershell.exe -ArgumentList @("-NoProfile", "-File", (Join-Path $Scripts "codex-listener.ps1"), "-PairId", $appPair.pair_id, "-CodexBin", $fakeCodex) -WindowStyle Hidden -PassThru
+        Wait-ForListener -PairDir $appPair.pair_dir
+        $first = & (Join-Path $Scripts "ask-worker.ps1") -WorkerId $appPair.pair_id -Message "first app turn" -TimeoutSec 20 -RawJson | Select-Object -Last 1 | ConvertFrom-Json
+        $second = & (Join-Path $Scripts "ask-worker.ps1") -WorkerId $appPair.pair_id -Message "second app turn" -TimeoutSec 20 -RawJson | Select-Object -Last 1 | ConvertFrom-Json
+        $appState = Get-Content -LiteralPath (Join-Path $appPair.pair_dir "state.json") -Raw | ConvertFrom-Json
+        Assert-True ($first.content -eq "fake app-server reply" -and $second.content -eq "fake app-server reply") "persistent app-server transport should return correlated turns"
+        Assert-True ($appState.codex_thread_id -eq "fake-app-thread") "app-server thread id should persist independently in worker state"
+        $owned = @(& (Join-Path $Scripts "list-workers.ps1") -OwnerId $ownerId -Json | ConvertFrom-Json)
+        Assert-True (@($owned | Where-Object { $_.worker_id -eq $appPair.worker_id }).Count -eq 1) "owner filtering should return the current Claude conversation's worker"
+
+        $eventPair = (& (Join-Path $Scripts "new-pair.ps1") -NoSpawn -OwnerId $ownerId -Transport legacy -Task "event wake" -CodexBin $fakeCodex -DryRunListener | Select-Object -Last 1) | ConvertFrom-Json
+        $eventListener = Start-Process powershell.exe -ArgumentList @("-NoProfile", "-File", (Join-Path $Scripts "codex-listener.ps1"), "-PairId", $eventPair.pair_id, "-CodexBin", $fakeCodex, "-PollIntervalSec", "30", "-DryRun") -WindowStyle Hidden -PassThru
+        Wait-ForListener -PairDir $eventPair.pair_dir
+        Start-Sleep -Milliseconds 250
+        $watch = [System.Diagnostics.Stopwatch]::StartNew()
+        $eventReply = & (Join-Path $Scripts "ask-worker.ps1") -WorkerId $eventPair.pair_id -Message "wake immediately" -TimeoutSec 10 -RawJson | Select-Object -Last 1 | ConvertFrom-Json
+        $watch.Stop()
+        Assert-True ($eventReply.type -eq "response" -and $watch.Elapsed.TotalSeconds -lt 5) "named events should wake a 30-second-idle listener immediately"
+    } finally {
+        if ($null -ne $appPair -and (Test-Path -LiteralPath $appPair.pair_dir)) { & (Join-Path $Scripts "end-pair.ps1") -PairId $appPair.pair_id -Delete | Out-Null }
+        if ($null -ne $eventPair -and (Test-Path -LiteralPath $eventPair.pair_dir)) { & (Join-Path $Scripts "end-pair.ps1") -PairId $eventPair.pair_id -Delete | Out-Null }
         Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
@@ -1059,6 +1135,7 @@ $TestGroups = [ordered]@{
     WorktreeIsolation = { Test-WorktreeIsolation }
     SkillCommandContracts = { Test-SkillCommandContracts }
     LatencyControls = { Test-LatencyControls }
+    FastTransport = { Test-EventDrivenAndAppServerTransport }
     InterruptedTurnRecovery = { Test-InterruptedTurnRecovery }
     ProgressUpdates = { Test-ProgressUpdates }
     ConcurrencyCap = { Test-ConcurrencyCap }
