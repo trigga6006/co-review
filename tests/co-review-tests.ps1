@@ -978,6 +978,29 @@ function Test-LatencyControls {
     }
 }
 
+function Test-SharedStartCancellationIsExplicit {
+    $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("co-review-start-cancel-" + [System.Guid]::NewGuid().ToString("N"))
+    $fakeCodex = New-FakeCodex -Directory $tempRoot
+    $pair = $null
+    try {
+        $pair = (& (Join-Path $Scripts "new-pair.ps1") -NoSpawn -Task "starting cancellation" -CodexBin $fakeCodex -CodexModel configured-default -CodexReasoning auto | Select-Object -Last 1) | ConvertFrom-Json
+        $activePath = Join-Path $pair.pair_dir "active-turn.json"
+        $active = [ordered]@{
+            message_id="msg-0001"; listener_pid=999998; process_pid=0
+            backend="app-server"; connection_mode="shared"; thread_id="fake-app-thread"
+            turn_id=""; phase="starting"; codex_bin=$fakeCodex
+            started_at=(Get-Date).ToString("o"); timeout_sec=60
+        }
+        [System.IO.File]::WriteAllText($activePath, ($active | ConvertTo-Json), [System.Text.UTF8Encoding]::new($false))
+        $cancelled = & (Join-Path $Scripts "cancel-worker.ps1") -WorkerId $pair.pair_id -MessageId msg-0001 -TurnIdWaitSec 1 -Json | ConvertFrom-Json
+        Assert-True ($cancelled.status -eq "cancellation-unconfirmed" -and $cancelled.active_process_stopped -eq $false) "cancelling a shared turn before its id arrives must not issue an empty interrupt or report success"
+        Remove-Item -LiteralPath $activePath -Force
+    } finally {
+        if ($null -ne $pair -and (Test-Path -LiteralPath $pair.pair_dir)) { & (Join-Path $Scripts "end-pair.ps1") -PairId $pair.pair_id -Delete | Out-Null }
+        Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Test-OwnerCleanup {
     $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("co-review-owner-" + [System.Guid]::NewGuid().ToString("N"))
     $fakeCodex = New-FakeCodex -Directory $tempRoot
@@ -1055,6 +1078,33 @@ function Test-EventDrivenAndAppServerTransport {
     } finally {
         if ($null -ne $appPair -and (Test-Path -LiteralPath $appPair.pair_dir)) { & (Join-Path $Scripts "end-pair.ps1") -PairId $appPair.pair_id -Delete | Out-Null }
         if ($null -ne $eventPair -and (Test-Path -LiteralPath $eventPair.pair_dir)) { & (Join-Path $Scripts "end-pair.ps1") -PairId $eventPair.pair_id -Delete | Out-Null }
+        Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-AppServerReadTimeoutInvalidatesDirectClient {
+    . (Join-Path $Scripts "common.ps1")
+    . (Join-Path $Scripts "app-server.ps1")
+    $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("co-review-read-timeout-" + [System.Guid]::NewGuid().ToString("N"))
+    $fakeCodex = New-FakeCodex -Directory $tempRoot -SleepMs 3000 -SupportsAppServer
+    $client = $null
+    try {
+        $client = Start-CoReviewAppServerClient -CodexBin $fakeCodex -WorkingDirectory $tempRoot -ConnectionMode direct
+        $threadId = Open-CoReviewAppServerThread -Client $client -WorkingDirectory $tempRoot -Sandbox read-only
+        $activePath = Join-Path $tempRoot "active-turn.json"
+        $outboxPath = Join-Path $tempRoot "to-claude.jsonl"
+        $timedOut = $false
+        $timeoutError = ""
+        try {
+            Invoke-CoReviewAppServerTurn -Client $client -PairId pair-timeout-test -ThreadId $threadId -Prompt "timeout" -WorkingDirectory $tempRoot -MessageId msg-0001 -OutboxPath $outboxPath -ActiveTurnFile $activePath -TimeoutSec 1 | Out-Null
+        } catch {
+            $timeoutError = $_.Exception.Message
+            $timedOut = $_.Exception.Message -match "timed out"
+        }
+        Assert-True $timedOut "a stalled direct app-server turn should report its timeout (actual: $timeoutError)"
+        Assert-True (-not (Test-CoReviewAppServerClientAlive -Client $client)) "a timed-out stdio read should invalidate the direct app-server client"
+    } finally {
+        Stop-CoReviewAppServerClient -Client $client
         Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
@@ -1240,10 +1290,16 @@ $TestGroups = [ordered]@{
     WriterLeases = { Test-WriterLeases }
     WorktreeIsolation = { Test-WorktreeIsolation }
     SkillCommandContracts = { Test-SkillCommandContracts }
-    LatencyControls = { Test-LatencyControls }
+    LatencyControls = {
+        Test-LatencyControls
+        Test-SharedStartCancellationIsExplicit
+    }
     OwnerCleanup = { Test-OwnerCleanup }
     SendSequenceRecovery = { Test-SendSequenceRecovery }
-    FastTransport = { Test-EventDrivenAndAppServerTransport }
+    FastTransport = {
+        Test-EventDrivenAndAppServerTransport
+        Test-AppServerReadTimeoutInvalidatesDirectClient
+    }
     InterruptedTurnRecovery = { Test-InterruptedTurnRecovery }
     ProgressUpdates = { Test-ProgressUpdates }
     ConcurrencyCap = { Test-ConcurrencyCap }

@@ -196,7 +196,12 @@ function Read-CoReviewAppServerMessage {
     } else {
         if ($null -eq $Client.process -or $Client.process.HasExited) { throw "Codex app-server connection exited" }
         $read = $Client.process.StandardOutput.ReadLineAsync()
-        if (-not $read.Wait([Math]::Max(1, $TimeoutMilliseconds))) { throw "Codex app-server response timed out" }
+        if (-not $read.Wait([Math]::Max(1, $TimeoutMilliseconds))) {
+            # ReadLineAsync cannot be cancelled on the supported runtimes. Retaining this
+            # client would leave an outstanding reader that can steal the next response.
+            Stop-CoReviewAppServerClient -Client $Client
+            throw "Codex app-server response timed out"
+        }
         $line = $read.Result
         if ($null -eq $line) { throw "Codex app-server connection closed" }
     }
@@ -289,6 +294,7 @@ function Stop-CoReviewAppServerClient {
     if ($null -eq $Client) { return }
     if ([string]$Client.transport_kind -eq "websocket") {
         try { $Client.websocket.Dispose() } catch {}
+        $Client.websocket = $null
         return
     }
     if ($null -eq $Client.process) { return }
@@ -297,13 +303,15 @@ function Stop-CoReviewAppServerClient {
         if (-not $Client.process.WaitForExit(2000)) { $Client.process.Kill(); $Client.process.WaitForExit() }
     } catch {}
     $Client.process.Dispose()
+    $Client.process = $null
 }
 
 function Test-CoReviewAppServerClientAlive {
     param($Client)
     if ($null -eq $Client) { return $false }
     if ([string]$Client.transport_kind -eq "websocket") { return ($null -ne $Client.websocket -and $Client.websocket.State -eq [System.Net.WebSockets.WebSocketState]::Open) }
-    return ($null -ne $Client.process -and -not $Client.process.HasExited)
+    try { return ($null -ne $Client.process -and -not $Client.process.HasExited) }
+    catch { return $false }
 }
 
 function Open-CoReviewAppServerThread {
@@ -407,7 +415,7 @@ function Invoke-CoReviewAppServerTurn {
         try { $message = Read-CoReviewAppServerMessage -Client $Client -TimeoutMilliseconds $remaining }
         catch {
             if ($_.Exception.Message -match 'timed out') {
-                if (-not [string]::IsNullOrWhiteSpace($turnId)) {
+                if (-not [string]::IsNullOrWhiteSpace($turnId) -and (Test-CoReviewAppServerClientAlive -Client $Client)) {
                     $Client.next_request_id = [long]$Client.next_request_id + 1
                     Write-CoReviewAppServerMessage -Client $Client -Message ([ordered]@{ id=[long]$Client.next_request_id; method="turn/interrupt"; params=[ordered]@{threadId=$ThreadId;turnId=$turnId} })
                 }

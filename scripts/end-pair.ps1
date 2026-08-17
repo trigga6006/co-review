@@ -32,10 +32,12 @@ Invoke-WithCoReviewMutex -Name $mutexName -ScriptBlock {
     [System.IO.File]::WriteAllText((Join-Path $pairDir "shutdown"), "", [System.Text.UTF8Encoding]::new($false))
     Signal-CoReviewChannel -PairId $PairId -Channel "inbox"
     $activePath = Join-Path $pairDir "active-turn.json"
+    $cancellationUnconfirmed = $false
     if (Test-Path -LiteralPath $activePath -PathType Leaf) {
         try {
             $active = Get-Content -LiteralPath $activePath -Raw | ConvertFrom-Json
-            & (Join-Path $PSScriptRoot "cancel-worker.ps1") -WorkerId $PairId -MessageId ([string]$active.message_id) -Json | Out-Null
+            $cancelResult = & (Join-Path $PSScriptRoot "cancel-worker.ps1") -WorkerId $PairId -MessageId ([string]$active.message_id) -Json | ConvertFrom-Json
+            $cancellationUnconfirmed = ([string]$cancelResult.status -eq "cancellation-unconfirmed")
         } catch {
             Write-Warning "Could not stop active Codex turn cleanly: $($_.Exception.Message)"
         }
@@ -44,6 +46,9 @@ Invoke-WithCoReviewMutex -Name $mutexName -ScriptBlock {
     $deadline = (Get-Date).AddSeconds(5)
     while ((Get-Date) -lt $deadline -and (Test-CoReviewListenerAlive -PairDir $pairDir -ListenerPid ([ref]$listenerPid))) { Start-Sleep -Milliseconds 200 }
     $listenerStillAlive = Test-CoReviewListenerAlive -PairDir $pairDir -ListenerPid ([ref]$listenerPid)
+    if ($listenerStillAlive -and $cancellationUnconfirmed) {
+        throw "The shared Codex turn has not supplied an interruptible turn id yet. Shutdown is queued, and the bounded listener will retire after the turn starts or times out; refusing to orphan it by killing the listener."
+    }
     if ($listenerStillAlive -and $null -ne $listenerPid) { Stop-CoReviewProcessTree -ProcessId $listenerPid }
     if ([string]$meta.mode -in @("workhorse", "imagegen")) { Release-WriterLease -PairId $PairId -WorkingDirectory ([string]$meta.project_cwd) }
 
