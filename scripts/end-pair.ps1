@@ -10,6 +10,21 @@ $ErrorActionPreference = "Stop"
 if ($Archive -and $Delete) { throw "Use either -Archive or -Delete, not both" }
 if ($RemoveWorktree -and -not $ConfirmRemoveWorktree) { throw "Removing a managed worktree requires -ConfirmRemoveWorktree" }
 $pairDir = Get-PairDir -PairId $PairId -MustExist
+
+function Remove-CoReviewPairDirectory {
+    param([Parameter(Mandatory=$true)][string]$Path)
+    $deadline = (Get-Date).AddSeconds(3)
+    do {
+        try {
+            Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+            return
+        } catch [System.IO.IOException] {
+            if ((Get-Date) -ge $deadline) { throw }
+            Start-Sleep -Milliseconds 100
+        }
+    } while ($true)
+}
+
 $mutexName = Get-CoReviewMutexName -Scope "lifecycle" -Key $PairId
 Invoke-WithCoReviewMutex -Name $mutexName -ScriptBlock {
     $meta = Get-NormalizedPairMetadata -PairDir $pairDir
@@ -37,7 +52,7 @@ Invoke-WithCoReviewMutex -Name $mutexName -ScriptBlock {
         Remove-CoReviewManagedWorktree -SourceRepo ([string]$meta.source_repo) -WorktreePath ([string]$meta.worktree_path)
     }
 
-    if ($Delete) { Remove-Item -LiteralPath $pairDir -Recurse -Force; Write-Host "[co-review] Deleted worker $PairId" }
+    if ($Delete) { Remove-CoReviewPairDirectory -Path $pairDir; Write-Host "[co-review] Deleted worker $PairId" }
     elseif ($Archive) {
         $archiveRoot = Join-Path (Get-CoReviewRoot) "archive"
         New-Item -ItemType Directory -Path $archiveRoot -Force | Out-Null

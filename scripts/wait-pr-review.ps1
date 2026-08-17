@@ -37,10 +37,11 @@ if ($PrNumber -le 0) {
 }
 
 $threadQuery = @'
-query($owner:String!, $name:String!, $number:Int!) {
+query($owner:String!, $name:String!, $number:Int!, $threadCursor:String) {
   repository(owner:$owner, name:$name) {
     pullRequest(number:$number) {
-      reviewThreads(first:100) {
+      reviewThreads(first:100, after:$threadCursor) {
+        pageInfo { hasNextPage endCursor }
         nodes { isResolved comments(first:1) { nodes { url path author { login } } } }
       }
     }
@@ -61,13 +62,15 @@ while ([DateTimeOffset]::Now -lt $deadline) {
         $headSeenAt = [DateTimeOffset]::Now
     }
 
-    $reviews = @(Invoke-GhJson -Arguments @("api", "-X", "GET", "repos/$Repo/pulls/$PrNumber/reviews?per_page=100"))
+    $reviewPages = Invoke-GhJson -Arguments @("api", "--paginate", "--slurp", "-X", "GET", "repos/$Repo/pulls/$PrNumber/reviews?per_page=100")
+    $reviews = @(); foreach ($page in @($reviewPages)) { foreach ($item in @($page)) { $reviews += $item } }
     $codexReviews = @($reviews | Where-Object {
         [string]$_.user.login -match '^(chatgpt-codex-connector|codex)(\[bot\])?$' -and
         [string]$_.commit_id -eq $headSha -and [string]$_.state -ne "DISMISSED"
     })
 
-    $comments = @(Invoke-GhJson -Arguments @("api", "-X", "GET", "repos/$Repo/issues/$PrNumber/comments?per_page=100"))
+    $commentPages = Invoke-GhJson -Arguments @("api", "--paginate", "--slurp", "-X", "GET", "repos/$Repo/issues/$PrNumber/comments?per_page=100")
+    $comments = @(); foreach ($page in @($commentPages)) { foreach ($item in @($page)) { $comments += $item } }
     $marker = "<!-- co-review-codex:$headSha -->"
     $alreadyTriggered = @($comments | Where-Object { [string]$_.body -match [regex]::Escape($marker) }).Count -gt 0
     $elapsedForHead = ([DateTimeOffset]::Now - $headSeenAt).TotalSeconds
@@ -97,8 +100,16 @@ while ([DateTimeOffset]::Now -lt $deadline) {
     $failedChecks = @($checks | Where-Object { [string]$_.bucket -in @("fail", "cancel") })
     $pendingChecks = @($checks | Where-Object { [string]$_.bucket -eq "pending" })
 
-    $threads = Invoke-GhJson -Arguments @("api", "graphql", "-f", "query=$threadQuery", "-F", "owner=$owner", "-F", "name=$name", "-F", "number=$PrNumber")
-    $unresolved = @($threads.data.repository.pullRequest.reviewThreads.nodes | Where-Object { -not $_.isResolved })
+    $unresolved = @()
+    $threadCursor = ""
+    do {
+        $threadArgs = @("api", "graphql", "-f", "query=$threadQuery", "-F", "owner=$owner", "-F", "name=$name", "-F", "number=$PrNumber")
+        if (-not [string]::IsNullOrWhiteSpace($threadCursor)) { $threadArgs += @("-F", "threadCursor=$threadCursor") }
+        $threads = Invoke-GhJson -Arguments $threadArgs
+        $threadPage = $threads.data.repository.pullRequest.reviewThreads
+        $unresolved += @($threadPage.nodes | Where-Object { -not $_.isResolved })
+        $threadCursor = if ($threadPage.pageInfo.hasNextPage) { [string]$threadPage.pageInfo.endCursor } else { "" }
+    } while (-not [string]::IsNullOrWhiteSpace($threadCursor))
 
     $lastStatus = [PSCustomObject]@{
         repo = $Repo

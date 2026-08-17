@@ -95,6 +95,33 @@ function Get-NextCoReviewSequence {
     }
 }
 
+function Get-CoReviewPendingRequestIds {
+    param(
+        [Parameter(Mandatory=$true)][string]$RequestPath,
+        [Parameter(Mandatory=$true)][string]$ReplyPath
+    )
+    $terminalReplies = @{}
+    if (Test-Path -LiteralPath $ReplyPath -PathType Leaf) {
+        foreach ($line in @([System.IO.File]::ReadLines($ReplyPath))) {
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            try { $reply = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+            if ([string]$reply.type -in @("response", "error") -and -not [string]::IsNullOrWhiteSpace([string]$reply.in_reply_to)) {
+                $terminalReplies[[string]$reply.in_reply_to] = $true
+            }
+        }
+    }
+    $pending = @()
+    if (Test-Path -LiteralPath $RequestPath -PathType Leaf) {
+        foreach ($line in @([System.IO.File]::ReadLines($RequestPath))) {
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            try { $request = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+            $requestId = [string]$request.id
+            if (-not [string]::IsNullOrWhiteSpace($requestId) -and -not $terminalReplies.ContainsKey($requestId)) { $pending += $requestId }
+        }
+    }
+    return @($pending)
+}
+
 function Read-CoReviewJsonlTail {
     param(
         [Parameter(Mandatory=$true)][string]$Path,

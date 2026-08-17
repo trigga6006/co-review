@@ -510,15 +510,25 @@ if (Test-Path -LiteralPath $activeTurnFile -PathType Leaf) {
                     if ([string]$replyObj.in_reply_to -eq $interruptedId -and [string]$replyObj.type -in @("response", "error")) { $alreadyReplied = $true; break }
                 }
             }
-            if (-not $alreadyReplied) {
-                [void](Append-Reply -InReplyTo $interruptedId -Content "" -ErrMsg "Codex turn was interrupted when the listener stopped; it was not replayed automatically.")
-                $recoveryState = Get-State
+            $recoveryState = Get-State
+            if ([string]$recoveryState.last_processed -ne $interruptedId) {
                 $recoveryState.last_processed = $interruptedId
+                $recoveryTail = Read-CoReviewJsonlTail -Path $toCodex -Offset ([long]$recoveryState.inbox_offset)
+                $interruptedRecord = @($recoveryTail.records | Where-Object { $null -ne $_.value -and [string]$_.value.id -eq $interruptedId } | Select-Object -First 1)
+                if ($interruptedRecord.Count -gt 0) {
+                    $recoveryState | Add-Member -NotePropertyName inbox_offset -NotePropertyValue ([long]$interruptedRecord[0].end_offset) -Force
+                }
                 $completed = if ($null -ne $recoveryState.PSObject.Properties['completed_turns']) { [int]$recoveryState.completed_turns } else { 0 }
                 $recoveryState | Add-Member -NotePropertyName completed_turns -NotePropertyValue ($completed + 1) -Force
+                # Persist the no-replay boundary before publishing a terminal
+                # reply. A crash after the reply can then never re-execute the
+                # interrupted request on the next restart.
                 Save-State $recoveryState
-                Write-Log "Recovered interrupted $interruptedId without replaying it"
             }
+            if (-not $alreadyReplied) {
+                [void](Append-Reply -InReplyTo $interruptedId -Content "" -ErrMsg "Codex turn was interrupted when the listener stopped; it was not replayed automatically.")
+            }
+            Write-Log "Recovered interrupted $interruptedId without replaying it"
         }
     } catch {
         Write-Log "Could not recover stale active turn: $($_.Exception.Message)"

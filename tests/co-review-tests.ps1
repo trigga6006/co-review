@@ -880,6 +880,8 @@ function Test-SkillCommandContracts {
     Assert-True ($skill -match "32 live workers" -and $skill -match "AllowHighFanout") "SKILL.md should document the widened fan-out cap"
     $newWorker = Get-Content -LiteralPath (Join-Path $Scripts "new-worker.ps1") -Raw
     Assert-True ($newWorker -match 'MaxConcurrentWorkers = 32') "new-worker should default to the widened 32-worker soft cap"
+    $prGate = Get-Content -LiteralPath (Join-Path $Scripts "wait-pr-review.ps1") -Raw
+    Assert-True ($prGate -match 'threadCursor' -and $prGate -match 'pageInfo' -and $prGate -match '--paginate') "PR gate should paginate reviews, comments, and review threads"
     Assert-True ($skill -match 'select `imagegen`' -and $skill -match "Do not claim otherwise based on stale product knowledge") "SKILL.md should select imagegen directly and reject stale capability assumptions"
     Assert-True ($skill -match "Actually call|actual image-generation tool call") "SKILL.md should require image generation rather than a prompt-only response"
     Assert-True ($skill -notmatch "Spawn at most one pair per Claude conversation") "obsolete one-pair restriction should be removed"
@@ -1019,9 +1021,16 @@ function Test-InterruptedTurnRecovery {
     $pair = $null
     try {
         $pair = (& (Join-Path $Scripts "new-pair.ps1") -NoSpawn -Task "interrupted recovery" -CodexBin $fakeCodex -CodexModel configured-default -CodexReasoning auto | Select-Object -Last 1) | ConvertFrom-Json
-        $request = @{id="msg-0001";ts=(Get-Date).ToString("o");from="claude";type="request";content="do not replay"} | ConvertTo-Json -Compress
-        [System.IO.File]::WriteAllText((Join-Path $pair.pair_dir "to-codex.jsonl"), $request + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
-        $active = @{message_id="msg-0001";listener_pid=999998;process_pid=999999;started_at=(Get-Date).AddMinutes(-1).ToString("o");timeout_sec=300} | ConvertTo-Json
+        $request1 = @{id="msg-0001";ts=(Get-Date).AddMinutes(-2).ToString("o");from="claude";type="request";content="already completed"} | ConvertTo-Json -Compress
+        $request2 = @{id="msg-0002";ts=(Get-Date).ToString("o");from="claude";type="request";content="do not replay"} | ConvertTo-Json -Compress
+        $requestJournal = $request1 + [Environment]::NewLine + $request2 + [Environment]::NewLine
+        [System.IO.File]::WriteAllText((Join-Path $pair.pair_dir "to-codex.jsonl"), $requestJournal, [System.Text.UTF8Encoding]::new($false))
+        $firstReply = @{id="cdx-0001";ts=(Get-Date).AddMinutes(-1).ToString("o");from="codex";in_reply_to="msg-0001";type="response";content="done"} | ConvertTo-Json -Compress
+        [System.IO.File]::WriteAllText((Join-Path $pair.pair_dir "to-claude.jsonl"), $firstReply + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
+        $firstOffset = [System.Text.Encoding]::UTF8.GetByteCount($request1 + [Environment]::NewLine)
+        $interruptedState = @{last_processed="msg-0001";codex_session_id=$null;codex_thread_id=$null;inbox_offset=$firstOffset;msg_counter=0;completed_turns=1} | ConvertTo-Json
+        [System.IO.File]::WriteAllText((Join-Path $pair.pair_dir "state.json"), $interruptedState, [System.Text.UTF8Encoding]::new($false))
+        $active = @{message_id="msg-0002";listener_pid=999998;process_pid=999999;started_at=(Get-Date).AddMinutes(-1).ToString("o");timeout_sec=300} | ConvertTo-Json
         [System.IO.File]::WriteAllText((Join-Path $pair.pair_dir "active-turn.json"), $active, [System.Text.UTF8Encoding]::new($false))
 
         $listener = Start-Process powershell.exe -ArgumentList @(
@@ -1032,13 +1041,20 @@ function Test-InterruptedTurnRecovery {
         $deadline = (Get-Date).AddSeconds(10)
         $reply = $null
         while ($null -eq $reply -and (Get-Date) -lt $deadline) {
-            $line = Get-Content -LiteralPath (Join-Path $pair.pair_dir "to-claude.jsonl") -ErrorAction SilentlyContinue | Select-Object -Last 1
-            if ($line) { $reply = $line | ConvertFrom-Json }
+            foreach ($line in @(Get-Content -LiteralPath (Join-Path $pair.pair_dir "to-claude.jsonl") -ErrorAction SilentlyContinue)) {
+                if (-not $line) { continue }
+                $candidate = $line | ConvertFrom-Json
+                if ($candidate.in_reply_to -eq "msg-0002") { $reply = $candidate; break }
+            }
             if ($null -eq $reply) { Start-Sleep -Milliseconds 100 }
         }
         $state = Get-Content -LiteralPath (Join-Path $pair.pair_dir "state.json") -Raw | ConvertFrom-Json
         Assert-True ($reply.type -eq "error" -and $reply.error -match "interrupted") "restart should report an interrupted turn"
-        Assert-True ($state.last_processed -eq "msg-0001") "restart should advance past an interrupted turn instead of replaying it"
+        Assert-True ($state.last_processed -eq "msg-0002") "restart should advance past a later interrupted turn instead of replaying it"
+        Assert-True ([long]$state.inbox_offset -eq [System.Text.Encoding]::UTF8.GetByteCount($requestJournal)) "recovery should advance the durable inbox offset past the interrupted request"
+        Start-Sleep -Milliseconds 500
+        $secondTurnReplies = @(Get-Content -LiteralPath (Join-Path $pair.pair_dir "to-claude.jsonl") | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object { $_.in_reply_to -eq "msg-0002" -and $_.type -in @("response", "error") })
+        Assert-True ($secondTurnReplies.Count -eq 1) "recovery should emit one interruption error and never replay the request"
     } finally {
         if ($null -ne $pair -and (Test-Path -LiteralPath $pair.pair_dir)) { & (Join-Path $Scripts "end-pair.ps1") -PairId $pair.pair_id -Delete | Out-Null }
         Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
@@ -1113,9 +1129,11 @@ function Test-BackwardCompatibility {
         codex_bin=$fakeCodex; codex_model="gpt-5.5"; codex_reasoning="medium"
     } | ConvertTo-Json
     [System.IO.File]::WriteAllText((Join-Path $pairDir "pair.json"), $legacyMeta, [System.Text.UTF8Encoding]::new($false))
-    [System.IO.File]::WriteAllText((Join-Path $pairDir "to-codex.jsonl"), "", [System.Text.UTF8Encoding]::new($false))
-    [System.IO.File]::WriteAllText((Join-Path $pairDir "to-claude.jsonl"), "", [System.Text.UTF8Encoding]::new($false))
-    $legacyState = @{ last_processed=$null; codex_session_id="legacy-thread"; msg_counter=0 } | ConvertTo-Json
+    $legacyRequest = @{id="msg-0001";ts="2000-01-01T00:00:01Z";from="claude";type="request";content="historical"} | ConvertTo-Json -Compress
+    $legacyReply = @{id="cdx-0001";ts="2000-01-01T00:00:02Z";from="codex";in_reply_to="msg-0001";type="response";content="historical done"} | ConvertTo-Json -Compress
+    [System.IO.File]::WriteAllText((Join-Path $pairDir "to-codex.jsonl"), $legacyRequest + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
+    [System.IO.File]::WriteAllText((Join-Path $pairDir "to-claude.jsonl"), $legacyReply + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
+    $legacyState = @{ last_processed="msg-0001"; codex_session_id="legacy-thread"; msg_counter=0 } | ConvertTo-Json
     [System.IO.File]::WriteAllText((Join-Path $pairDir "state.json"), $legacyState, [System.Text.UTF8Encoding]::new($false))
     $legacyListenerPid = $null
     try {
@@ -1126,7 +1144,7 @@ function Test-BackwardCompatibility {
         Assert-True ($ensured.status -eq "active") "legacy pair should restart through worker recovery"
         $legacyListenerPid = [int]$ensured.listener_pid
         $legacyReply = & (Join-Path $Scripts "ask-worker.ps1") -WorkerId $pairId -Message "legacy ask" -TimeoutSec 20 -RawJson | Select-Object -Last 1 | ConvertFrom-Json
-        Assert-True ($legacyReply.content -eq "fake codex reply") "legacy pairs should support correlated ask-worker replies"
+        Assert-True ($legacyReply.content -eq "fake codex reply") "legacy pairs with completed history should not be treated as permanently busy"
         $stateAfter = Get-Content -LiteralPath (Join-Path $pairDir "state.json") -Raw | ConvertFrom-Json
         Assert-True ($stateAfter.codex_session_id -eq "legacy-thread") "recovery should preserve an existing Codex thread id"
     } finally {

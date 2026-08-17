@@ -75,17 +75,27 @@ try {
     }
 
     if (-not $Queue) {
-        $sentCount = Get-CoReviewSequence -PairDir $pairDir -Channel "inbox" -FallbackQueuePath $toCodex
-        $completedCount = 0
-        $statePath = Join-Path $pairDir "state.json"
+        $sequencePath = Get-CoReviewSequencePath -PairDir $pairDir -Channel "inbox"
+        $queueState = $null
         if (Test-Path -LiteralPath $statePath -PathType Leaf) {
-            try {
-                $queueState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -ErrorAction Stop
-                if ($null -ne $queueState.PSObject.Properties["completed_turns"]) { $completedCount = [long]$queueState.completed_turns }
-            } catch {}
+            try { $queueState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -ErrorAction Stop } catch {}
         }
-        if ($sentCount -gt $completedCount) {
-            throw "Worker $PairId is busy or already queued ($($sentCount - $completedCount) pending). Wait/cancel it, or pass -Queue to enqueue intentionally."
+        $hasSynchronizedCounters = [int]$meta.schema_version -ge 2 -and
+            (Test-Path -LiteralPath $sequencePath -PathType Leaf) -and
+            $null -ne $queueState -and $null -ne $queueState.PSObject.Properties["completed_turns"]
+        if ($hasSynchronizedCounters) {
+            $sentCount = Get-CoReviewSequence -PairDir $pairDir -Channel "inbox" -FallbackQueuePath $toCodex
+            $pendingCount = [Math]::Max(0, $sentCount - [long]$queueState.completed_turns)
+            $pendingIds = @()
+        } else {
+            # Schema-v1 workers predate the sequence/completed-turn counters.
+            # Reconcile their durable journals instead of treating all history
+            # as permanently pending.
+            $pendingIds = @(Get-CoReviewPendingRequestIds -RequestPath $toCodex -ReplyPath (Join-Path $pairDir "to-claude.jsonl"))
+            $pendingCount = $pendingIds.Count
+        }
+        if ($pendingCount -gt 0) {
+            throw "Worker $PairId is busy or already queued ($pendingCount pending). Wait/cancel it, or pass -Queue to enqueue intentionally."
         }
     }
 
