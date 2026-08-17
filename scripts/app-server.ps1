@@ -385,6 +385,15 @@ function Invoke-CoReviewAppServerTurn {
 
     $Client.next_request_id = [long]$Client.next_request_id + 1
     $requestId = [long]$Client.next_request_id
+    $connectionPid = if ($null -ne $Client.process) { $Client.process.Id } else { 0 }
+    $active = [ordered]@{
+        message_id=$MessageId; listener_pid=$PID; process_pid=$connectionPid
+        backend="app-server"; connection_mode=$Client.connection_mode
+        thread_id=$ThreadId; turn_id=""; phase="starting"; codex_bin=$Client.codex_bin
+        started_at=(Get-Date).ToString("o"); timeout_sec=$TimeoutSec
+    }
+    # Establish the no-replay marker before turn/start can begin executing.
+    [System.IO.File]::WriteAllText($ActiveTurnFile, ($active | ConvertTo-Json -Depth 8), [System.Text.UTF8Encoding]::new($false))
     Write-CoReviewAppServerMessage -Client $Client -Message ([ordered]@{ id=$requestId; method="turn/start"; params=$params })
 
     $deadline = [DateTimeOffset]::Now.AddSeconds($TimeoutSec)
@@ -411,13 +420,8 @@ function Invoke-CoReviewAppServerTurn {
             if ($null -ne $message.error) { throw "Codex app-server turn/start failed: $([string]$message.error.message)" }
             $turnId = [string]$message.result.turn.id
             if ([string]::IsNullOrWhiteSpace($turnId)) { throw "Codex app-server did not return a turn id" }
-            $connectionPid = if ($null -ne $Client.process) { $Client.process.Id } else { 0 }
-            $active = [ordered]@{
-                message_id=$MessageId; listener_pid=$PID; process_pid=$connectionPid
-                backend="app-server"; connection_mode=$Client.connection_mode
-                thread_id=$ThreadId; turn_id=$turnId; codex_bin=$Client.codex_bin
-                started_at=(Get-Date).ToString("o"); timeout_sec=$TimeoutSec
-            }
+            $active.turn_id = $turnId
+            $active.phase = "running"
             [System.IO.File]::WriteAllText($ActiveTurnFile, ($active | ConvertTo-Json -Depth 8), [System.Text.UTF8Encoding]::new($false))
             continue
         }

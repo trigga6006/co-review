@@ -131,6 +131,12 @@ while ([DateTimeOffset]::Now -lt $deadline) {
         exit 1
     }
     if ($lastStatus.ready) {
+        # Close the race between the iteration's initial head read and success.
+        $latestPr = Invoke-GhJson -Arguments @("pr", "view", [string]$PrNumber, "--repo", $Repo, "--json", "headRefOid")
+        if ([string]$latestPr.headRefOid -ne $headSha) {
+            $headSha = ""
+            continue
+        }
         if ($Json) { $lastStatus | ConvertTo-Json -Depth 6 } else { Write-Host "[co-review] PR #$PrNumber is review-ready at $headSha" -ForegroundColor Green }
         exit 0
     }

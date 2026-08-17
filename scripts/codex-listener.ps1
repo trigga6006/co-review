@@ -34,6 +34,7 @@ $progressStateFile = Join-Path $pairDir "progress.json"
 $cancelDir = Join-Path $pairDir "cancelled"
 $inboxSignal = Open-CoReviewSignal -PairId $PairId -Channel "inbox"
 $script:appServerClient = $null
+$script:appServerLoadedThreadId = ""
 $script:listenerMeta = $null
 $script:listenerClosed = $false
 
@@ -601,6 +602,7 @@ while ($true) {
                     if (-not (Test-CoReviewAppServerClientAlive -Client $script:appServerClient)) {
                         try {
                             $script:appServerClient = Start-CoReviewAppServerClient -CodexBin $CodexBin -WorkingDirectory $workDir -ConnectionMode "auto"
+                            $script:appServerLoadedThreadId = ""
                             Write-Log "Connected to Codex app-server ($($script:appServerClient.connection_mode))"
                         } catch {
                             if ($requestedTransport -eq "auto") {
@@ -612,8 +614,12 @@ while ($true) {
                 }
                 if ($activeTransport -eq "app-server") {
                     $threadId = [string]$state.codex_thread_id
-                    if ([string]::IsNullOrWhiteSpace($threadId)) {
-                        $threadId = Open-CoReviewAppServerThread -Client $script:appServerClient -WorkingDirectory $workDir -Sandbox $workerSandbox -Model $effectiveModel -WorkspaceRoots (@($workDir) + @($workerAddDirs))
+                    if ([string]::IsNullOrWhiteSpace([string]$script:appServerLoadedThreadId) -or [string]$script:appServerLoadedThreadId -ne $threadId) {
+                        $existingThreadId = $threadId
+                        $threadId = Open-CoReviewAppServerThread -Client $script:appServerClient -ExistingThreadId $existingThreadId -WorkingDirectory $workDir -Sandbox $workerSandbox -Model $effectiveModel -WorkspaceRoots (@($workDir) + @($workerAddDirs))
+                        $script:appServerLoadedThreadId = $threadId
+                    }
+                    if ([string]::IsNullOrWhiteSpace([string]$state.codex_thread_id)) {
                         $capturedThreadId = $threadId
                         Write-Host "    [co-review] Captured app-server thread id: $threadId" -ForegroundColor DarkCyan
                         Write-Log "Captured app-server thread_id=$threadId"

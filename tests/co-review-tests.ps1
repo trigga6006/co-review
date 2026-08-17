@@ -60,6 +60,7 @@ public static class $typeName {
                 return 0;
             }
             if (Array.IndexOf(args, "--listen") >= 0) { return 2; }
+            bool threadLoaded = false;
             string line;
             while ((line = Console.ReadLine()) != null) {
                 Match match = Regex.Match(line, "\"id\"\\s*:\\s*(\\d+)");
@@ -67,8 +68,14 @@ public static class $typeName {
                 if (line.Contains("\"method\":\"initialize\"")) {
                     Console.WriteLine("{\"id\":" + id + ",\"result\":{\"codexHome\":\"fake\",\"platformFamily\":\"windows\",\"platformOs\":\"windows\",\"userAgent\":\"fake\"}}");
                 } else if (line.Contains("\"method\":\"thread/start\"") || line.Contains("\"method\":\"thread/resume\"")) {
+                    threadLoaded = true;
                     Console.WriteLine("{\"id\":" + id + ",\"result\":{\"thread\":{\"id\":\"fake-app-thread\"}}}");
                 } else if (line.Contains("\"method\":\"turn/start\"")) {
+                    if (!threadLoaded) {
+                        Console.WriteLine("{\"id\":" + id + ",\"error\":{\"message\":\"thread not loaded\"}}");
+                        Console.Out.Flush();
+                        continue;
+                    }
                     Console.WriteLine("{\"id\":" + id + ",\"result\":{\"turn\":{\"id\":\"fake-app-turn\"}}}");
                     Console.Out.Flush();
                     Thread.Sleep($SleepMs);
@@ -882,6 +889,11 @@ function Test-SkillCommandContracts {
     Assert-True ($newWorker -match 'MaxConcurrentWorkers = 32') "new-worker should default to the widened 32-worker soft cap"
     $prGate = Get-Content -LiteralPath (Join-Path $Scripts "wait-pr-review.ps1") -Raw
     Assert-True ($prGate -match 'threadCursor' -and $prGate -match 'pageInfo' -and $prGate -match '--paginate') "PR gate should paginate reviews, comments, and review threads"
+    Assert-True ($prGate -match 'latestPr' -and $prGate -match 'latestPr\.headRefOid -ne \$headSha') "PR gate should revalidate the head immediately before readiness"
+    $appServer = Get-Content -LiteralPath (Join-Path $Scripts "app-server.ps1") -Raw
+    $preStartMarker = $appServer.IndexOf('[System.IO.File]::WriteAllText($ActiveTurnFile')
+    $turnStart = $appServer.IndexOf('method="turn/start"')
+    Assert-True ($preStartMarker -ge 0 -and $preStartMarker -lt $turnStart) "app-server should persist the active marker before sending turn/start"
     $listener = Get-Content -LiteralPath (Join-Path $Scripts "codex-listener.ps1") -Raw
     $durableBoundary = $listener.LastIndexOf('Save-State $state')
     $terminalPublish = $listener.LastIndexOf('$rid = Append-Reply')
@@ -1025,6 +1037,10 @@ function Test-EventDrivenAndAppServerTransport {
         $appState = Get-Content -LiteralPath (Join-Path $appPair.pair_dir "state.json") -Raw | ConvertFrom-Json
         Assert-True ($first.content -eq "fake app-server reply" -and $second.content -eq "fake app-server reply") "persistent app-server transport should return correlated turns"
         Assert-True ($appState.codex_thread_id -eq "fake-app-thread") "app-server thread id should persist independently in worker state"
+        & (Join-Path $Scripts "end-worker.ps1") -WorkerId $appPair.pair_id | Out-Null
+        $reconnected = & (Join-Path $Scripts "ensure-worker.ps1") -WorkerId $appPair.pair_id -Json | Select-Object -Last 1 | ConvertFrom-Json
+        $third = & (Join-Path $Scripts "ask-worker.ps1") -WorkerId $appPair.pair_id -Message "resume after reconnect" -TimeoutSec 20 -RawJson | Select-Object -Last 1 | ConvertFrom-Json
+        Assert-True ($reconnected.restarted -eq $true -and $third.content -eq "fake app-server reply") "a new app-server client should resume the saved thread before its next turn"
         $owned = @(& (Join-Path $Scripts "list-workers.ps1") -OwnerId $ownerId -Json | ConvertFrom-Json)
         Assert-True (@($owned | Where-Object { $_.worker_id -eq $appPair.worker_id }).Count -eq 1) "owner filtering should return the current Claude conversation's worker"
 
