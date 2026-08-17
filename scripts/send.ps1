@@ -75,31 +75,22 @@ try {
     }
 
     if (-not $Queue) {
-        $sequencePath = Get-CoReviewSequencePath -PairDir $pairDir -Channel "inbox"
-        $queueState = $null
-        if (Test-Path -LiteralPath $statePath -PathType Leaf) {
-            try { $queueState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -ErrorAction Stop } catch {}
-        }
-        $hasSynchronizedCounters = [int]$meta.schema_version -ge 2 -and
-            (Test-Path -LiteralPath $sequencePath -PathType Leaf) -and
-            $null -ne $queueState -and $null -ne $queueState.PSObject.Properties["completed_turns"]
-        if ($hasSynchronizedCounters) {
-            $sentCount = Get-CoReviewSequence -PairDir $pairDir -Channel "inbox" -FallbackQueuePath $toCodex
-            $pendingCount = [Math]::Max(0, $sentCount - [long]$queueState.completed_turns)
-            $pendingIds = @()
-        } else {
-            # Schema-v1 workers predate the sequence/completed-turn counters.
-            # Reconcile their durable journals instead of treating all history
-            # as permanently pending.
-            $pendingIds = @(Get-CoReviewPendingRequestIds -RequestPath $toCodex -ReplyPath (Join-Path $pairDir "to-claude.jsonl"))
-            $pendingCount = $pendingIds.Count
-        }
+        # The journals are authoritative. This also reconciles schema-v1 state
+        # and a sender crash between reserving an id and appending its request.
+        $pendingIds = @(Get-CoReviewPendingRequestIds -RequestPath $toCodex -ReplyPath (Join-Path $pairDir "to-claude.jsonl"))
+        $pendingCount = $pendingIds.Count
         if ($pendingCount -gt 0) {
             throw "Worker $PairId is busy or already queued ($pendingCount pending). Wait/cancel it, or pass -Queue to enqueue intentionally."
         }
     }
 
-    $cnt = Get-NextCoReviewSequence -PairId $PairId -PairDir $pairDir -Channel "inbox" -FallbackQueuePath $toCodex
+    [long]$cnt = 0
+    foreach ($line in @([System.IO.File]::ReadLines($toCodex))) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        try { $existing = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+        if ([string]$existing.id -match '^msg-(\d+)$') { $cnt = [Math]::Max($cnt, [long]$Matches[1]) }
+    }
+    $cnt++
     $msgId = "msg-{0:D4}" -f $cnt
 
     $msgObj = @{
@@ -114,7 +105,10 @@ try {
     if ($TurnTimeoutSec -gt 0) { $msgObj.turn_timeout_sec = $TurnTimeoutSec }
     $msg = $msgObj | ConvertTo-Json -Compress -Depth 10
 
+    # Append the durable request first. If the following sequence cache write
+    # fails, the next sender derives the id from this journal and self-heals.
     [System.IO.File]::AppendAllText($toCodex, ($msg + [Environment]::NewLine), [System.Text.UTF8Encoding]::new($false))
+    [System.IO.File]::WriteAllText((Get-CoReviewSequencePath -PairDir $pairDir -Channel "inbox"), [string]$cnt, [System.Text.UTF8Encoding]::new($false))
     Signal-CoReviewChannel -PairId $PairId -Channel "inbox"
 } finally {
     if ($locked) { $mutex.ReleaseMutex() | Out-Null }

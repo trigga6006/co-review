@@ -882,6 +882,11 @@ function Test-SkillCommandContracts {
     Assert-True ($newWorker -match 'MaxConcurrentWorkers = 32') "new-worker should default to the widened 32-worker soft cap"
     $prGate = Get-Content -LiteralPath (Join-Path $Scripts "wait-pr-review.ps1") -Raw
     Assert-True ($prGate -match 'threadCursor' -and $prGate -match 'pageInfo' -and $prGate -match '--paginate') "PR gate should paginate reviews, comments, and review threads"
+    $listener = Get-Content -LiteralPath (Join-Path $Scripts "codex-listener.ps1") -Raw
+    $durableBoundary = $listener.LastIndexOf('Save-State $state')
+    $terminalPublish = $listener.LastIndexOf('$rid = Append-Reply')
+    $markerClear = $listener.LastIndexOf('Remove-Item -LiteralPath $activeTurnFile')
+    Assert-True ($durableBoundary -ge 0 -and $durableBoundary -lt $terminalPublish -and $terminalPublish -lt $markerClear) "listener should persist completion before publishing a terminal reply and clearing recovery state"
     Assert-True ($skill -match 'select `imagegen`' -and $skill -match "Do not claim otherwise based on stale product knowledge") "SKILL.md should select imagegen directly and reject stale capability assumptions"
     Assert-True ($skill -match "Actually call|actual image-generation tool call") "SKILL.md should require image generation rather than a prompt-only response"
     Assert-True ($skill -notmatch "Spawn at most one pair per Claude conversation") "obsolete one-pair restriction should be removed"
@@ -978,6 +983,29 @@ function Test-OwnerCleanup {
         foreach ($worker in $workers) {
             if (Test-Path -LiteralPath $worker.pair_dir) { & (Join-Path $Scripts "end-pair.ps1") -PairId $worker.pair_id -Delete | Out-Null }
         }
+        Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-SendSequenceRecovery {
+    $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("co-review-send-sequence-" + [System.Guid]::NewGuid().ToString("N"))
+    $fakeCodex = New-FakeCodex -Directory $tempRoot
+    $pair = $null
+    try {
+        $pair = (& (Join-Path $Scripts "new-pair.ps1") -NoSpawn -Task "sequence recovery" -CodexBin $fakeCodex -CodexModel configured-default -CodexReasoning auto | Select-Object -Last 1) | ConvertFrom-Json
+        [System.IO.File]::WriteAllText((Join-Path $pair.pair_dir ".inbox.seq"), "7", [System.Text.UTF8Encoding]::new($false))
+        $firstId = & (Join-Path $Scripts "send.ps1") -PairId $pair.pair_id -Message "first durable request" -NoEnsure | Select-Object -Last 1
+        Assert-True ($firstId -eq "msg-0001") "sender should reconcile a sequence cache that is ahead of an empty journal"
+        $firstRequest = Get-Content -LiteralPath (Join-Path $pair.pair_dir "to-codex.jsonl") | Select-Object -Last 1 | ConvertFrom-Json
+        Assert-True ($firstRequest.id -eq "msg-0001" -and (Get-Content -LiteralPath (Join-Path $pair.pair_dir ".inbox.seq") -Raw).Trim() -eq "1") "request append should self-heal the sequence cache"
+
+        $firstReply = @{id="cdx-0001";ts=(Get-Date).ToString("o");from="codex";in_reply_to="msg-0001";type="response";content="done"} | ConvertTo-Json -Compress
+        [System.IO.File]::AppendAllText((Join-Path $pair.pair_dir "to-claude.jsonl"), $firstReply + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
+        [System.IO.File]::WriteAllText((Join-Path $pair.pair_dir ".inbox.seq"), "9", [System.Text.UTF8Encoding]::new($false))
+        $secondId = & (Join-Path $Scripts "send.ps1") -PairId $pair.pair_id -Message "second durable request" -NoEnsure | Select-Object -Last 1
+        Assert-True ($secondId -eq "msg-0002") "sender should derive the next id from the durable journal rather than a stale sequence cache"
+    } finally {
+        if ($null -ne $pair -and (Test-Path -LiteralPath $pair.pair_dir)) { & (Join-Path $Scripts "end-pair.ps1") -PairId $pair.pair_id -Delete | Out-Null }
         Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
@@ -1198,6 +1226,7 @@ $TestGroups = [ordered]@{
     SkillCommandContracts = { Test-SkillCommandContracts }
     LatencyControls = { Test-LatencyControls }
     OwnerCleanup = { Test-OwnerCleanup }
+    SendSequenceRecovery = { Test-SendSequenceRecovery }
     FastTransport = { Test-EventDrivenAndAppServerTransport }
     InterruptedTurnRecovery = { Test-InterruptedTurnRecovery }
     ProgressUpdates = { Test-ProgressUpdates }

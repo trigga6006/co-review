@@ -482,9 +482,8 @@ function Invoke-Codex {
             StdoutLines = $stdoutLines
         }
     } finally {
-        if (-not [string]::IsNullOrWhiteSpace($ActiveTurnFile)) {
-            Remove-Item -LiteralPath $ActiveTurnFile -Force -ErrorAction SilentlyContinue
-        }
+        # The caller removes the active-turn marker only after the durable
+        # completion boundary and terminal reply are committed.
         Remove-Item -ErrorAction SilentlyContinue $lastMsgFile.FullName
         Remove-Item -ErrorAction SilentlyContinue $stdoutEventFile.FullName
     }
@@ -569,20 +568,19 @@ while ($true) {
 
         $capturedSid = $null
         $capturedThreadId = $null
+        $terminalContent = ""
+        $terminalError = ""
         $cancelMarker = Join-Path $cancelDir ([string]$msg.id + ".cancel")
         $completedTurns = if ($null -ne $state.PSObject.Properties['completed_turns']) { [int]$state.completed_turns } else { 0 }
         $maxTurns = [int]$meta.max_turns
         if (Test-Path -LiteralPath $cancelMarker -PathType Leaf) {
-            $rid = Append-Reply -InReplyTo $msg.id -Content "" -ErrMsg "Codex turn was cancelled before execution."
-            Remove-Item -LiteralPath $cancelMarker -Force -ErrorAction SilentlyContinue
+            $terminalError = "Codex turn was cancelled before execution."
             Write-Log "Cancelled queued $($msg.id) before execution"
         } elseif ($maxTurns -gt 0 -and $completedTurns -ge $maxTurns) {
-            $rid = Append-Reply -InReplyTo $msg.id -Content "" -ErrMsg "Worker turn limit reached ($maxTurns). Start a fresh worker or explicitly create one with a larger -MaxTurns value."
+            $terminalError = "Worker turn limit reached ($maxTurns). Start a fresh worker or explicitly create one with a larger -MaxTurns value."
             Write-Log "Rejected $($msg.id): max_turns=$maxTurns"
         } elseif ($DryRun) {
-            $reply = "[DRY RUN] Echo of your message:`n`n$($msg.content)"
-            $rid = Append-Reply -InReplyTo $msg.id -Content $reply
-            Write-Host "<<< Replied (dry run) as $rid" -ForegroundColor Magenta
+            $terminalContent = "[DRY RUN] Echo of your message:`n`n$($msg.content)"
         } else {
             try {
                 $effectiveModel = if ($msg.model) { [string]$msg.model } else { $CodexModel }
@@ -635,30 +633,25 @@ while ($true) {
                     if (-not [string]::IsNullOrWhiteSpace($partialReply)) { $errText += "`npartial output:`n$partialReply" }
                     Write-Host "    ERROR: $errText" -ForegroundColor Red
                     Write-Log "ERROR on $($msg.id): $errText"
-                    $rid = Append-Reply -InReplyTo $msg.id -Content "" -ErrMsg $errText
+                    $terminalError = $errText
                 } else {
                     if ($activeTransport -eq "legacy" -and $result.SessionId -and -not $state.codex_session_id) {
                         $capturedSid = $result.SessionId
                         Write-Host "    [co-review] Captured codex session id: $capturedSid" -ForegroundColor DarkCyan
                         Write-Log "Captured session_id=$capturedSid"
                     }
-                    $rid = Append-Reply -InReplyTo $msg.id -Content $result.Reply
-                    Write-Host "<<< Replied as $rid ($($result.Reply.Length) chars)" -ForegroundColor Magenta
-                    Write-Log "Replied $rid for $($msg.id)"
+                    $terminalContent = [string]$result.Reply
                 }
             } catch {
                 $errText = $_.Exception.Message
                 Write-Host "    EXCEPTION: $errText" -ForegroundColor Red
                 Write-Log "EXCEPTION on $($msg.id): $errText"
-                $rid = Append-Reply -InReplyTo $msg.id -Content "" -ErrMsg $errText
+                $terminalError = $errText
             }
         }
 
-        Remove-Item -LiteralPath $activeTurnFile -Force -ErrorAction SilentlyContinue
-        Remove-Item -LiteralPath $cancelMarker -Force -ErrorAction SilentlyContinue
-
-        # One state save per message - load fresh, apply both updates, save once.
-        # (Append-Reply doesn't touch state.json, so the only writer here is this block.)
+        # Commit the no-replay boundary before publishing the terminal reply or
+        # clearing the recovery marker.
         $state = Get-State
         $state.last_processed = $msg.id
         $state | Add-Member -NotePropertyName inbox_offset -NotePropertyValue ([long]$msg._queue_end_offset) -Force
@@ -671,6 +664,14 @@ while ($true) {
             $state | Add-Member -NotePropertyName codex_thread_id -NotePropertyValue $capturedThreadId -Force
         }
         Save-State $state
+        $rid = Append-Reply -InReplyTo $msg.id -Content $terminalContent -ErrMsg $terminalError
+        if ($DryRun) { Write-Host "<<< Replied (dry run) as $rid" -ForegroundColor Magenta }
+        elseif ([string]::IsNullOrWhiteSpace($terminalError)) {
+            Write-Host "<<< Replied as $rid ($($terminalContent.Length) chars)" -ForegroundColor Magenta
+            Write-Log "Replied $rid for $($msg.id)"
+        }
+        Remove-Item -LiteralPath $activeTurnFile -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $cancelMarker -Force -ErrorAction SilentlyContinue
         if ($maxTurns -gt 0 -and [int]$state.completed_turns -ge $maxTurns) {
             $retireAfterBatch = $true
         }
