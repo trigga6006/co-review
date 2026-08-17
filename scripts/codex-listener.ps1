@@ -34,20 +34,33 @@ $progressStateFile = Join-Path $pairDir "progress.json"
 $cancelDir = Join-Path $pairDir "cancelled"
 $inboxSignal = Open-CoReviewSignal -PairId $PairId -Channel "inbox"
 $script:appServerClient = $null
+$script:listenerMeta = $null
+$script:listenerClosed = $false
+
+function Close-CoReviewListenerResources {
+    if ($script:listenerClosed) { return }
+    $script:listenerClosed = $true
+    try { Stop-CoReviewAppServerClient -Client $script:appServerClient } catch {}
+    try { $inboxSignal.Dispose() } catch {}
+    try {
+        if ($null -ne $script:listenerMeta -and [string]$script:listenerMeta.mode -in @("workhorse", "imagegen")) {
+            Release-WriterLease -PairId $PairId -WorkingDirectory ([string]$script:listenerMeta.project_cwd)
+        }
+    } catch {}
+    Remove-Item -ErrorAction SilentlyContinue $pidFile
+}
 
 # Write our PID so list-pairs can verify the listener is actually alive
 [System.IO.File]::WriteAllText($pidFile, $PID, [System.Text.UTF8Encoding]::new($false))
-# Ensure we clean up the pid file on exit (graceful or not - the trap covers Ctrl+C too)
-$cleanupPidFile = $pidFile
+# Ensure we clean up the pid file and writer lease on exit, including Ctrl+C.
 trap {
-    try { Stop-CoReviewAppServerClient -Client $script:appServerClient } catch {}
-    try { $inboxSignal.Dispose() } catch {}
-    Remove-Item -ErrorAction SilentlyContinue $cleanupPidFile
-    continue
+    Close-CoReviewListenerResources
+    break
 }
 
 # Load metadata through the shared schema-v1 compatibility boundary.
 $meta = Get-NormalizedPairMetadata -PairDir $pairDir
+$script:listenerMeta = $meta
 if ([string]::IsNullOrWhiteSpace($CodexBin)) { $CodexBin = $meta.codex_bin }
 if ([string]::IsNullOrWhiteSpace($CodexModel)) { $CodexModel = [string]$meta.codex_model }
 if ([string]::IsNullOrWhiteSpace($CodexReasoning)) { $CodexReasoning = [string]$meta.codex_reasoning }
@@ -479,6 +492,8 @@ function Invoke-Codex {
 
 # Main loop
 Write-Log "Listener started for $PairId"
+$lastActivityAt = [DateTimeOffset]::Now
+$retireAfterBatch = $false
 
 # A hard-killed listener used to leave the current request unacknowledged. On
 # restart that caused a mutating writable-worker turn to run a second time. Convert a
@@ -524,7 +539,17 @@ while ($true) {
     $state = Get-State
     $newMsgs = @(Read-NewIncoming -LastId $state.last_processed -Offset ([long]$state.inbox_offset))
 
+    if ($newMsgs.Count -eq 0 -and [int]$meta.idle_timeout_sec -gt 0) {
+        $idleSeconds = ([DateTimeOffset]::Now - $lastActivityAt).TotalSeconds
+        if ($idleSeconds -ge [int]$meta.idle_timeout_sec) {
+            Write-Host "[co-review] Idle timeout reached. Retiring worker." -ForegroundColor Yellow
+            Write-Log "Idle timeout reached after $([int]$idleSeconds)s; listener retiring."
+            break
+        }
+    }
+
     foreach ($msg in $newMsgs) {
+        $lastActivityAt = [DateTimeOffset]::Now
         Write-Host ""
         Write-Host ">>> Incoming from Claude: $($msg.id) ($($msg.ts))" -ForegroundColor Green
         $preview = if ($msg.content.Length -gt 200) { $msg.content.Substring(0, 200) + "... [" + ($msg.content.Length - 200) + " more chars]" } else { $msg.content }
@@ -636,16 +661,28 @@ while ($true) {
             $state | Add-Member -NotePropertyName codex_thread_id -NotePropertyValue $capturedThreadId -Force
         }
         Save-State $state
+        if ($maxTurns -gt 0 -and [int]$state.completed_turns -ge $maxTurns) {
+            $retireAfterBatch = $true
+        }
+    }
+
+    if ($retireAfterBatch) {
+        Write-Host "[co-review] Turn budget completed. Retiring worker." -ForegroundColor Yellow
+        Write-Log "Turn budget completed; listener retiring."
+        break
     }
 
     if ($newMsgs.Count -eq 0) {
-        [void](Wait-CoReviewChannel -Signal $inboxSignal -TimeoutMilliseconds ([Math]::Max(50, $PollIntervalSec * 1000)))
+        $waitMs = [Math]::Max(50, $PollIntervalSec * 1000)
+        if ([int]$meta.idle_timeout_sec -gt 0) {
+            $remainingIdleMs = [Math]::Max(1, ([int]$meta.idle_timeout_sec * 1000) - [int]([DateTimeOffset]::Now - $lastActivityAt).TotalMilliseconds)
+            $waitMs = [Math]::Min($waitMs, $remainingIdleMs)
+        }
+        [void](Wait-CoReviewChannel -Signal $inboxSignal -TimeoutMilliseconds $waitMs)
     }
 }
 
-Stop-CoReviewAppServerClient -Client $script:appServerClient
-$inboxSignal.Dispose()
-Remove-Item -ErrorAction SilentlyContinue $pidFile
+Close-CoReviewListenerResources
 
 Write-Host ""
-Write-Host "[co-review] Listener exited. Window will stay open - close it manually." -ForegroundColor DarkGray
+Write-Host "[co-review] Listener exited." -ForegroundColor DarkGray

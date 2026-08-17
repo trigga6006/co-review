@@ -15,6 +15,7 @@ param(
     [ValidatePattern('^$|^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$')][string]$OwnerId = "",
     [int]$TimeoutSec = 300,
     [ValidateRange(0, 1000)][int]$MaxTurns = 2,
+    [ValidateRange(0, 86400)][int]$IdleTimeoutSec = 900,
     [ValidateRange(0, 10)][int]$MaxProgressUpdates = 2,
     [ValidateRange(0, 3600)][int]$ProgressMinIntervalSec = 30,
     [ValidateRange(1, 1000)][int]$MaxConcurrentWorkers = 32,
@@ -44,7 +45,7 @@ $selection = Resolve-CoReviewRoleSelection -Capabilities $capabilities -Mode $Mo
 $params = @{
     WorkerName = $Name; Mode = $Mode; Task = $Task; ProjectCwd = $ProjectCwd; CodexBin = $CodexBin
     CodexModel = $selection.model; CodexReasoning = $selection.reasoning; Isolation = $Isolation; Sandbox = $Sandbox
-    WindowMode = $WindowMode; CodexTimeoutSec = $TimeoutSec; MaxTurns = $MaxTurns; MaxProgressUpdates = $MaxProgressUpdates
+    WindowMode = $WindowMode; CodexTimeoutSec = $TimeoutSec; MaxTurns = $MaxTurns; IdleTimeoutSec = $IdleTimeoutSec; MaxProgressUpdates = $MaxProgressUpdates
     ProgressMinIntervalSec = $ProgressMinIntervalSec; Profile = $Profile; AddDir = $AddDir; Transport = $Transport; OwnerId = $OwnerId
     ConfigOverride = $ConfigOverride; Search = $Search; AllowDirtyBase = $AllowDirtyBase
     ConfirmDangerFullAccess = $ConfirmDangerFullAccess; NoSpawn = $NoSpawn; DryRunListener = $DryRunListener

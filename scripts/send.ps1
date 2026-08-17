@@ -19,6 +19,20 @@ $ErrorActionPreference = "Stop"
 
 $pairDir = Get-PairDir -PairId $PairId -MustExist
 
+$meta = Get-NormalizedPairMetadata -PairDir $pairDir
+$statePath = Join-Path $pairDir "state.json"
+if ([int]$meta.max_turns -gt 0 -and (Test-Path -LiteralPath $statePath -PathType Leaf)) {
+    try {
+        $turnState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -ErrorAction Stop
+        $completedTurns = if ($null -ne $turnState.PSObject.Properties["completed_turns"]) { [int]$turnState.completed_turns } else { 0 }
+        if ($completedTurns -ge [int]$meta.max_turns) {
+            throw "Worker $PairId reached its turn limit ($($meta.max_turns)) and has retired. Start a fresh worker for a new responsibility."
+        }
+    } catch {
+        if ($_.Exception.Message -match "reached its turn limit") { throw }
+    }
+}
+
 if (-not $NoEnsure) {
     & (Join-Path $PSScriptRoot "ensure-pair.ps1") -PairId $PairId -Json | Out-Null
 }

@@ -8,6 +8,7 @@ param(
     [string]$CodexReasoning = "medium",
     [int]$CodexTimeoutSec = 1800,
     [ValidateRange(0, 1000)][int]$MaxTurns = 0,
+    [ValidateRange(0, 86400)][int]$IdleTimeoutSec = 900,
     [ValidateRange(0, 10)][int]$MaxProgressUpdates = 0,
     [ValidateRange(0, 3600)][int]$ProgressMinIntervalSec = 30,
     [ValidateSet("Minimized", "Hidden", "Foreground")][string]$WindowMode = "Minimized",
@@ -134,6 +135,7 @@ try {
         search_enabled = [bool]$Search
         codex_timeout_sec = $CodexTimeoutSec
         max_turns = $MaxTurns
+        idle_timeout_sec = $IdleTimeoutSec
         max_progress_updates = $MaxProgressUpdates
         progress_min_interval_sec = $ProgressMinIntervalSec
         transport = $Transport
@@ -186,6 +188,7 @@ try {
         codex_reasoning = $CodexReasoning
         codex_timeout_sec = $CodexTimeoutSec
         max_turns = $MaxTurns
+        idle_timeout_sec = $IdleTimeoutSec
         max_progress_updates = $MaxProgressUpdates
         progress_min_interval_sec = $ProgressMinIntervalSec
         transport = $Transport

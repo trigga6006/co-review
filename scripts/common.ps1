@@ -595,6 +595,7 @@ function Get-NormalizedPairMetadata {
         $meta | Add-Member -NotePropertyName search_enabled -NotePropertyValue $false -Force
         $meta | Add-Member -NotePropertyName config_overrides -NotePropertyValue @() -Force
         $meta | Add-Member -NotePropertyName max_turns -NotePropertyValue 0 -Force
+        $meta | Add-Member -NotePropertyName idle_timeout_sec -NotePropertyValue 0 -Force
         $meta | Add-Member -NotePropertyName max_progress_updates -NotePropertyValue 0 -Force
         $meta | Add-Member -NotePropertyName progress_min_interval_sec -NotePropertyValue 30 -Force
         $meta | Add-Member -NotePropertyName transport -NotePropertyValue "auto" -Force
@@ -607,6 +608,11 @@ function Get-NormalizedPairMetadata {
         # Existing workers remain unlimited for backward compatibility. New
         # workers get a bounded default through new-worker.ps1.
         $meta | Add-Member -NotePropertyName max_turns -NotePropertyValue 0 -Force
+    }
+    if ($null -eq $meta.PSObject.Properties["idle_timeout_sec"]) {
+        # Preserve old workers exactly. Newly created workers receive a bounded
+        # idle lifetime through new-pair.ps1/new-worker.ps1.
+        $meta | Add-Member -NotePropertyName idle_timeout_sec -NotePropertyValue 0 -Force
     }
     if ($null -eq $meta.PSObject.Properties["max_progress_updates"]) {
         $meta | Add-Member -NotePropertyName max_progress_updates -NotePropertyValue 0 -Force
@@ -780,8 +786,15 @@ function Stop-CoReviewProcessTree {
     }
     $treeIds.Add($ProcessId)
 
-    & taskkill.exe /PID $ProcessId /T /F 2>$null | Out-Null
-    $taskkillExitCode = $LASTEXITCODE
+    $taskkillExitCode = 1
+    try {
+        & taskkill.exe /PID $ProcessId /T /F 2>$null | Out-Null
+        $taskkillExitCode = $LASTEXITCODE
+    } catch {
+        # The process can exit between the initial liveness check and taskkill.
+        # The explicit remaining-process check below is authoritative.
+        $taskkillExitCode = 1
+    }
     $remainingIds = @($treeIds | Where-Object { $null -ne (Get-Process -Id $_ -ErrorAction SilentlyContinue) })
     if ($taskkillExitCode -ne 0 -or $remainingIds.Count -gt 0) {
         $killIds = @($treeIds.ToArray())

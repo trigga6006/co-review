@@ -654,12 +654,12 @@ function Test-WorkerLifecycle {
         Assert-True ((Resolve-CoReviewWindowStyle -WindowMode Foreground) -eq "Normal") "Foreground should map to the PowerShell Normal window style"
         $startupJson = & (Join-Path $Scripts "new-worker.ps1") -Name "startup-timeout" -Mode review -Task "startup timeout" -ProjectCwd $projectWithSpaces -Model gpt-test-frontier -Reasoning medium -CodexBin $fakeCodex -DryRunListener -NoSpawn | Select-Object -Last 1
         $startupWorker = $startupJson | ConvertFrom-Json
-        Assert-True ($startupWorker.codex_timeout_sec -eq 300 -and $startupWorker.max_turns -eq 2) "new-worker should apply bounded latency defaults"
+        Assert-True ($startupWorker.codex_timeout_sec -eq 300 -and $startupWorker.max_turns -eq 2 -and $startupWorker.idle_timeout_sec -eq 900) "new-worker should apply bounded latency defaults"
         $startupRejected = $false
         try { Start-CoReviewListener -PairId $startupWorker.worker_id -PairDir $startupWorker.pair_dir -WindowMode Hidden -StartupWaitSec 0 | Out-Null } catch { $startupRejected = $true }
         Assert-True $startupRejected "listener startup should fail instead of returning a null validated PID"
         foreach ($name in @("review-security", "review-performance")) {
-            $json = & (Join-Path $Scripts "new-worker.ps1") -Name $name -Mode review -Task "review task" -ProjectCwd $RepoRoot -Model gpt-test-frontier -Reasoning medium -CodexBin $fakeCodex -DryRunListener -AllowHighFanout | Select-Object -Last 1
+            $json = & (Join-Path $Scripts "new-worker.ps1") -Name $name -Mode review -Task "review task" -ProjectCwd $RepoRoot -Model gpt-test-frontier -Reasoning medium -CodexBin $fakeCodex -DryRunListener -MaxTurns 4 -AllowHighFanout | Select-Object -Last 1
             $worker = $json | ConvertFrom-Json
             $workers += $worker
             Assert-True ($worker.worker_id -eq $worker.pair_id) "worker output should retain the compatible pair id"
@@ -690,7 +690,13 @@ function Test-WorkerLifecycle {
         Assert-True ($recoveryReply.content -match "preserve this queue") "recovery fixture should have a non-empty correlated queue"
         $recoveryMetaBefore = Get-Content -LiteralPath (Join-Path $recoveryWorker.pair_dir "pair.json") -Raw | ConvertFrom-Json
         $recoveryStatePath = Join-Path $recoveryWorker.pair_dir "state.json"
-        $recoveryState = Get-Content -LiteralPath $recoveryStatePath -Raw | ConvertFrom-Json
+        $stateDeadline = (Get-Date).AddSeconds(5)
+        do {
+            $recoveryState = Get-Content -LiteralPath $recoveryStatePath -Raw | ConvertFrom-Json
+            if ([int]$recoveryState.completed_turns -ge 1) { break }
+            Start-Sleep -Milliseconds 50
+        } while ((Get-Date) -lt $stateDeadline)
+        Assert-True ([int]$recoveryState.completed_turns -ge 1) "listener should persist completed-turn state before recovery mutation"
         $recoveryState | Add-Member -NotePropertyName codex_session_id -NotePropertyValue "recovery-thread" -Force
         [System.IO.File]::WriteAllText($recoveryStatePath, ($recoveryState | ConvertTo-Json -Depth 10), [System.Text.UTF8Encoding]::new($false))
         $queueBefore = [System.IO.File]::ReadAllText((Join-Path $recoveryWorker.pair_dir "to-codex.jsonl"))
@@ -856,7 +862,7 @@ function Test-SkillCommandContracts {
     $skill = Get-Content -LiteralPath (Join-Path $RepoRoot "SKILL.md") -Raw
     foreach ($required in @(
         "get-capabilities.ps1", "new-worker.ps1", "ask-worker.ps1", "send-worker.ps1", "recv-worker.ps1", "cancel-worker.ps1",
-        "list-workers.ps1", "ensure-worker.ps1", "end-worker.ps1", "review", "workhorse", "imagegen", "writer lease",
+        "list-workers.ps1", "ensure-worker.ps1", "end-worker.ps1", "end-owner.ps1", "wait-pr-review.ps1", "review", "workhorse", "imagegen", "writer lease",
         "worktree", "Hidden", "danger-full-access", "ConfirmDangerFullAccess", "leaf worker"
     )) {
         Assert-True ($skill -match [regex]::Escape($required)) "SKILL.md should document $required"
@@ -868,6 +874,7 @@ function Test-SkillCommandContracts {
     Assert-True ($skill -match "gpt-5\.6-luna" -and $skill -match "gpt-5\.6-sol" -and $skill -match "Light by default") "SKILL.md should define the default Luna plus Sol light profile"
     Assert-True ($skill -match "xhigh.*Luna|Luna.*xhigh" -and $skill -match 'Never select `max` or `ultra` automatically') "SKILL.md should bound automatic deep reasoning"
     Assert-True ($skill -match "cancel.*timeout|timeout.*cancel") "SKILL.md should cancel hidden work after wait timeout"
+    Assert-True ($skill -match "15-minute idle timeout" -and $skill -match "retire") "SKILL.md should document automatic listener retirement"
     Assert-True ($skill -match "progress updates" -and $skill -match "IncludeProgress" -and $skill -match "UntilFinal") "SKILL.md should teach bounded progress polling"
     Assert-True ($skill -match "Light.*1.*1" -and $skill -match "Medium.*2.*1" -and $skill -match "High.*5.*2" -and $skill -match "XHigh.*10.*3") "SKILL.md should document increasing fan-out tiers"
     Assert-True ($skill -match "32 live workers" -and $skill -match "AllowHighFanout") "SKILL.md should document the widened fan-out cap"
@@ -928,10 +935,47 @@ function Test-LatencyControls {
     try {
         $limited = (& (Join-Path $Scripts "new-pair.ps1") -Task "turn limit" -CodexBin $fakeCodex -CodexModel configured-default -CodexReasoning auto -MaxTurns 1 -DryRunListener -WindowMode Hidden | Select-Object -Last 1) | ConvertFrom-Json
         $first = & (Join-Path $Scripts "ask-worker.ps1") -WorkerId $limited.pair_id -Message "first" -TimeoutSec 20 -RawJson | Select-Object -Last 1 | ConvertFrom-Json
-        $second = & (Join-Path $Scripts "ask-worker.ps1") -WorkerId $limited.pair_id -Message "second" -TimeoutSec 20 -RawJson -AllowErrorReply | Select-Object -Last 1 | ConvertFrom-Json
-        Assert-True ($first.type -eq "response" -and $second.type -eq "error" -and $second.error -match "turn limit") "listener should enforce MaxTurns"
+        $retireDeadline = (Get-Date).AddSeconds(10)
+        while ((Test-Path -LiteralPath (Join-Path $limited.pair_dir "listener.pid")) -and (Get-Date) -lt $retireDeadline) { Start-Sleep -Milliseconds 100 }
+        $second = Invoke-ScriptExpectFailure -ScriptName "ask-worker.ps1" -ScriptArgs @("-WorkerId",$limited.pair_id,"-Message","second","-TimeoutSec","20","-RawJson")
+        Assert-True ($first.type -eq "response" -and -not (Test-Path -LiteralPath (Join-Path $limited.pair_dir "listener.pid"))) "listener should retire after its final allowed turn"
+        Assert-True ($second.ExitCode -ne 0 -and $second.Output -match "turn limit.*retired") "retired workers should reject new work without restarting"
     } finally {
         if ($null -ne $limited -and (Test-Path -LiteralPath $limited.pair_dir)) { & (Join-Path $Scripts "end-pair.ps1") -PairId $limited.pair_id -Delete | Out-Null }
+        Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    $idle = $null
+    try {
+        $fakeCodex = New-FakeCodex -Directory (Join-Path $tempRoot "idle")
+        $idle = (& (Join-Path $Scripts "new-pair.ps1") -NoSpawn -Task "idle timeout" -CodexBin $fakeCodex -CodexModel configured-default -CodexReasoning auto -IdleTimeoutSec 1 -DryRunListener | Select-Object -Last 1) | ConvertFrom-Json
+        $idleListener = Start-Process powershell.exe -ArgumentList @("-NoProfile", "-File", (Join-Path $Scripts "codex-listener.ps1"), "-PairId", $idle.pair_id, "-CodexBin", $fakeCodex, "-PollIntervalSec", "30", "-DryRun") -WindowStyle Hidden -PassThru
+        Wait-ForListener -PairDir $idle.pair_dir
+        Assert-True ($idleListener.WaitForExit(10000)) "idle timeout should retire an unused listener without a polling process"
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $idle.pair_dir "listener.pid"))) "idle retirement should remove the listener pid"
+    } finally {
+        if ($null -ne $idle -and (Test-Path -LiteralPath $idle.pair_dir)) { & (Join-Path $Scripts "end-pair.ps1") -PairId $idle.pair_id -Delete | Out-Null }
+        Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-OwnerCleanup {
+    $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("co-review-owner-" + [System.Guid]::NewGuid().ToString("N"))
+    $fakeCodex = New-FakeCodex -Directory $tempRoot
+    $ownerId = "claude-owner-cleanup"
+    $workers = @()
+    try {
+        foreach ($index in 1..2) {
+            $workers += ((& (Join-Path $Scripts "new-pair.ps1") -NoSpawn -OwnerId $ownerId -Task "owner cleanup $index" -CodexBin $fakeCodex -CodexModel configured-default -CodexReasoning auto | Select-Object -Last 1) | ConvertFrom-Json)
+        }
+        $parsed = & (Join-Path $Scripts "end-owner.ps1") -OwnerId $ownerId -Delete -Json | ConvertFrom-Json
+        $result = @(); foreach ($item in $parsed) { $result += $item }
+        Assert-True ($result.Count -eq 2 -and @($result | Where-Object { $_.status -eq "stopped" }).Count -eq 2) "end-owner should stop every worker owned by one orchestrator"
+        foreach ($worker in $workers) { Assert-True (-not (Test-Path -LiteralPath $worker.pair_dir)) "end-owner -Delete should remove owned worker state" }
+    } finally {
+        foreach ($worker in $workers) {
+            if (Test-Path -LiteralPath $worker.pair_dir) { & (Join-Path $Scripts "end-pair.ps1") -PairId $worker.pair_id -Delete | Out-Null }
+        }
         Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
@@ -1135,6 +1179,7 @@ $TestGroups = [ordered]@{
     WorktreeIsolation = { Test-WorktreeIsolation }
     SkillCommandContracts = { Test-SkillCommandContracts }
     LatencyControls = { Test-LatencyControls }
+    OwnerCleanup = { Test-OwnerCleanup }
     FastTransport = { Test-EventDrivenAndAppServerTransport }
     InterruptedTurnRecovery = { Test-InterruptedTurnRecovery }
     ProgressUpdates = { Test-ProgressUpdates }

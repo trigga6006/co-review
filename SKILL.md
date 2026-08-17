@@ -35,7 +35,7 @@ Image generation is a separate first-class path, not generic workhorse delegatio
 
 Use Standard for the default pair. Use Deep work only under the Luna criteria above. Never select `max` or `ultra` automatically. "Strongest model" selects model capability; it does not by itself imply extreme reasoning.
 
-New workers default to a 300-second process timeout, two total turns, and at most two meaningful progress updates per turn. A second turn is reserved for one targeted clarification or one verified blocker. Start a fresh worker only when the responsibility genuinely changes. Do not repeatedly ask Codex to re-review its own work.
+New workers default to a 300-second process timeout, two total turns, a 15-minute idle timeout, and at most two meaningful progress updates per turn. A second turn is reserved for one targeted clarification or one verified blocker. A worker retires after its final turn or idle timeout and releases its writer lease. Start a fresh worker only when the responsibility genuinely changes. Do not repeatedly ask Codex to re-review its own work.
 
 ## Choose the mode
 
@@ -157,11 +157,23 @@ Progress messages contain only explicitly marked, high-confidence findings; they
 
 Claude evaluates the result, integrates useful findings, and finishes. One targeted follow-up is allowed only for an unresolved blocker or ambiguous correctness/security evidence. Do not ask broad follow-ups, request ceremonial re-reviews, or wait for Codex after Claude already has enough evidence to proceed.
 
-Stop workers when the task finishes or pivots:
+Workers normally retire themselves. When the task finishes or pivots, close every worker from this Claude conversation with one owner-scoped command:
 
 ```powershell
-& "$coReview\end-worker.ps1" -WorkerId $worker.worker_id
+& "$coReview\end-owner.ps1" -OwnerId $coReviewOwner
 ```
+
+Use `end-worker.ps1` only for an individual early stop. Never create a separate cleanup listener.
+
+### PR review gate
+
+When the task ends in a pull request, use the bounded foreground gate instead of polling in the background:
+
+```powershell
+& "$coReview\wait-pr-review.ps1" -Repo owner/repo -PrNumber 123 -TimeoutSec 900
+```
+
+It requires a Codex review of the current head, settled successful checks, and no unresolved review threads. Automatic Codex review gets a five-minute grace period; if none appears, the gate posts `@codex review` once for that head. It exits ready, failed, or timed out and never leaves a watcher running.
 
 ## Complete examples
 
@@ -235,7 +247,7 @@ The `imagegen` initialization envelope independently tells Codex that image gene
 - Automatic worktree isolation refuses a dirty source repository unless the user accepts `-AllowDirtyBase` committed-HEAD-only context.
 - Use `danger-full-access` only when explicitly requested and pass `-ConfirmDangerFullAccess`.
 - Do not ask workers to spawn agents. The leaf-worker envelope prohibits delegation; legacy execution additionally forces `features.multi_agent=false`.
-- New workers allow two turns by default. Use `-MaxTurns 0` only when the user explicitly wants an open-ended persistent worker.
+- New workers allow two turns and 15 idle minutes by default. Use `-MaxTurns 0` or `-IdleTimeoutSec 0` only when the user explicitly wants that limit disabled; disabling both creates a persistent listener and requires explicit user intent.
 - Allow at most 32 live workers by default. Beyond 32, require an explicit user count and pass `-AllowHighFanout`. Each `new-worker.ps1` call creates one independently addressed leaf Codex thread; never enable nested Codex agents.
 - Give every Claude conversation a unique `-OwnerId`. Treat foreign-owned workers as out of scope even though the global registry makes their capacity visible.
 - Keep progress at the default two meaningful updates per turn. Set `-MaxProgressUpdates 0` to disable it.
@@ -254,6 +266,8 @@ The `imagegen` initialization envelope independently tells Codex that image gene
 | `cancel-worker.ps1` | Cancel an active or queued turn |
 | `ensure-worker.ps1` | Verify/restart a listener without replaying interrupted work |
 | `end-worker.ps1` | Stop and optionally archive/delete a worker |
+| `end-owner.ps1` | Stop every worker created by one orchestrator run |
+| `wait-pr-review.ps1` | Bounded foreground gate for Codex review, CI, and review threads |
 | `purge-worker.ps1` | Permanently delete stopped worker state |
 
 Legacy pair-oriented commands remain compatibility aliases.

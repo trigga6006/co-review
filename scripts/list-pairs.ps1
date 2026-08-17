@@ -63,7 +63,7 @@ foreach ($dir in @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction Sile
         codex_model=[string]$meta.codex_model; codex_reasoning=[string]$meta.codex_reasoning; transport=[string]$meta.transport; listener_pid=$listenerPid; status=$status
         codex_session_id=if($state -and -not [string]::IsNullOrWhiteSpace([string]$state.codex_thread_id)){[string]$state.codex_thread_id}elseif($state){[string]$state.codex_session_id}else{""}; writer_lease=$hasLease; last_activity=$lastActivity
         active_message_id=if($activeTurn){[string]$activeTurn.message_id}else{""}; active_elapsed_sec=$activeElapsedSec
-        queue_depth=$pendingIds.Count; pending_message_ids=@($pendingIds); completed_turns=if($state -and $null -ne $state.PSObject.Properties['completed_turns']){[int]$state.completed_turns}else{0}; max_turns=[int]$meta.max_turns
+        queue_depth=$pendingIds.Count; pending_message_ids=@($pendingIds); completed_turns=if($state -and $null -ne $state.PSObject.Properties['completed_turns']){[int]$state.completed_turns}else{0}; max_turns=[int]$meta.max_turns; idle_timeout_sec=[int]$meta.idle_timeout_sec
         progress_count=if($progress){[int]$progress.count}else{0}; last_progress_at=if($progress){[string]$progress.last_progress_at}else{""}; last_progress=if($progress){[string]$progress.last_progress}else{""}
         max_progress_updates=[int]$meta.max_progress_updates
     }

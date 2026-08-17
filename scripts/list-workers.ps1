@@ -15,6 +15,7 @@ $workers = @($pairs | ForEach-Object {
         thread_id=$_.codex_session_id; transport=$_.transport; writer_lease=$_.writer_lease; last_activity=$_.last_activity; task_hint=$_.task_hint
         active_message_id=$_.active_message_id; active_elapsed_sec=$_.active_elapsed_sec; queue_depth=$_.queue_depth
         pending_message_ids=@($_.pending_message_ids); completed_turns=$_.completed_turns; max_turns=$_.max_turns
+        idle_timeout_sec=$_.idle_timeout_sec
         progress_count=$_.progress_count; last_progress_at=$_.last_progress_at; last_progress=$_.last_progress; max_progress_updates=$_.max_progress_updates
     }
 })
