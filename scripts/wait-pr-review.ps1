@@ -5,7 +5,7 @@ param(
     [ValidateRange(30, 7200)][int]$TimeoutSec = 900,
     [ValidateRange(5, 300)][int]$PollIntervalSec = 20,
     [ValidateRange(0, 1800)][int]$CodexGraceSec = 300,
-    [bool]$TriggerCodex = $true,
+    [switch]$NoTriggerCodex,
     [switch]$Json
 )
 
@@ -13,8 +13,11 @@ $ErrorActionPreference = "Stop"
 
 function Invoke-GhJson {
     param([Parameter(Mandatory=$true)][string[]]$Arguments)
-    $raw = & gh @Arguments 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "gh $($Arguments -join ' ') failed: $($raw | Out-String)" }
+    $oldPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try { $raw = & gh @Arguments 2>&1; $exitCode = $LASTEXITCODE }
+    finally { $ErrorActionPreference = $oldPreference }
+    if ($exitCode -ne 0) { throw "gh $($Arguments -join ' ') failed: $($raw | Out-String)" }
     $text = ($raw | Out-String).Trim()
     if ([string]::IsNullOrWhiteSpace($text)) { return $null }
     return $text | ConvertFrom-Json
@@ -68,17 +71,25 @@ while ([DateTimeOffset]::Now -lt $deadline) {
     $marker = "<!-- co-review-codex:$headSha -->"
     $alreadyTriggered = @($comments | Where-Object { [string]$_.body -match [regex]::Escape($marker) }).Count -gt 0
     $elapsedForHead = ([DateTimeOffset]::Now - $headSeenAt).TotalSeconds
-    if ($TriggerCodex -and $codexReviews.Count -eq 0 -and -not $alreadyTriggered -and $elapsedForHead -ge $CodexGraceSec) {
+    if (-not $NoTriggerCodex -and $codexReviews.Count -eq 0 -and -not $alreadyTriggered -and $elapsedForHead -ge $CodexGraceSec) {
         $commentBody = "@codex review`n`n$marker"
-        $commentOutput = & gh pr comment $PrNumber --repo $Repo --body $commentBody 2>&1
-        if ($LASTEXITCODE -ne 0) { throw "Could not request Codex review: $($commentOutput | Out-String)" }
+        $oldPreference = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        try { $commentOutput = & gh pr comment $PrNumber --repo $Repo --body $commentBody 2>&1; $commentExit = $LASTEXITCODE }
+        finally { $ErrorActionPreference = $oldPreference }
+        if ($commentExit -ne 0) { throw "Could not request Codex review: $($commentOutput | Out-String)" }
         $alreadyTriggered = $true
     }
 
-    $checksRaw = & gh pr checks $PrNumber --repo $Repo --json name,bucket,state,link 2>&1
-    $checksExit = $LASTEXITCODE
+    $oldPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try { $checksRaw = & gh pr checks $PrNumber --repo $Repo --json name,bucket,state,link 2>&1; $checksExit = $LASTEXITCODE }
+    finally { $ErrorActionPreference = $oldPreference }
     $checks = @()
-    if (-not [string]::IsNullOrWhiteSpace(($checksRaw | Out-String))) {
+    $checksText = ($checksRaw | Out-String).Trim()
+    if ($checksExit -ne 0 -and $checksText -match "no checks reported") {
+        $checks = @()
+    } elseif (-not [string]::IsNullOrWhiteSpace($checksText)) {
         try { $checks = @(($checksRaw | Out-String) | ConvertFrom-Json) } catch {
             if ($checksExit -ne 0) { throw "Could not inspect PR checks: $($checksRaw | Out-String)" }
         }
@@ -105,7 +116,7 @@ while ([DateTimeOffset]::Now -lt $deadline) {
 
     if ($failedChecks.Count -gt 0) {
         if ($Json) { $lastStatus | ConvertTo-Json -Depth 6 } else { $lastStatus | Format-List }
-        Write-Error "PR #$PrNumber has failing checks"
+        [Console]::Error.WriteLine("PR #$PrNumber has failing checks")
         exit 1
     }
     if ($lastStatus.ready) {
@@ -121,5 +132,5 @@ while ([DateTimeOffset]::Now -lt $deadline) {
 }
 
 if ($Json -and $null -ne $lastStatus) { $lastStatus | ConvertTo-Json -Depth 6 }
-Write-Error "Timed out after ${TimeoutSec}s waiting for current-head Codex review, successful checks, and resolved review threads on PR #$PrNumber"
+[Console]::Error.WriteLine("Timed out after ${TimeoutSec}s waiting for current-head Codex review, successful checks, and resolved review threads on PR #$PrNumber")
 exit 2
