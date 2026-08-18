@@ -877,6 +877,7 @@ function Test-SkillCommandContracts {
     Assert-True ($skill -match "explicit.*user|user.*explicit") "explicit user model/reasoning choices should take precedence"
     Assert-True ($skill -match "cache_stale" -and $skill -match "configured-default") "skill should teach Claude to avoid automatic selection from a stale cache"
     Assert-True ($skill -match "Claude.*sole orchestrator") "SKILL.md should keep Claude as sole orchestrator"
+    Assert-True ($skill -match "native Opus and Sonnet subagents" -and $skill -match "never replaces native fan-out") "SKILL.md should keep native Claude subagents active alongside Codex leaves"
     Assert-True ($skill -match "two total turns|two turns" -and $skill -match "300-second|300 seconds") "SKILL.md should bound default latency and turn count"
     Assert-True ($skill -match "gpt-5\.6-luna" -and $skill -match "gpt-5\.6-sol" -and $skill -match "Light by default") "SKILL.md should define the default Luna plus Sol light profile"
     Assert-True ($skill -match "xhigh.*Luna|Luna.*xhigh" -and $skill -match 'Never select `max` or `ultra` automatically') "SKILL.md should bound automatic deep reasoning"

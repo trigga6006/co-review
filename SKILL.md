@@ -7,6 +7,8 @@ description: Use when the user asks Claude to use co-review/Codex/GPT as a codin
 
 Claude is the sole orchestrator. Codex processes are leaf workers and must not spawn or coordinate other agents.
 
+"Sole orchestrator" does not mean "only Claude process." Claude should continue using its native Opus and Sonnet subagents for same-family parallelism; co-review adds Codex leaves for cross-family coverage and never replaces native fan-out. The no-spawn rules in this skill apply to Codex workers, not to Claude's orchestration of native subagents.
+
 ## Prime directive
 
 Optimize for finishing the user's task. Keep Claude as the sole orchestrator and keep every Codex process a dedicated leaf worker.
