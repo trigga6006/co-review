@@ -72,9 +72,24 @@ while ([DateTimeOffset]::Now -lt $deadline) {
     $commentPages = Invoke-GhJson -Arguments @("api", "--paginate", "--slurp", "-X", "GET", "repos/$Repo/issues/$PrNumber/comments?per_page=100")
     $comments = @(); foreach ($page in @($commentPages)) { foreach ($item in @($page)) { $comments += $item } }
     $marker = "<!-- co-review-codex:$headSha -->"
-    $alreadyTriggered = @($comments | Where-Object { [string]$_.body -match [regex]::Escape($marker) }).Count -gt 0
+    $triggerComments = @($comments | Where-Object { [string]$_.body -match [regex]::Escape($marker) })
+    $alreadyTriggered = $triggerComments.Count -gt 0
+    $codexCleanPass = $false
+    if ($codexReviews.Count -eq 0) {
+        foreach ($triggerComment in $triggerComments) {
+            $reactionPages = Invoke-GhJson -Arguments @("api", "--paginate", "--slurp", "-X", "GET", "repos/$Repo/issues/comments/$([long]$triggerComment.id)/reactions?per_page=100")
+            $reactions = @(); foreach ($page in @($reactionPages)) { foreach ($item in @($page)) { $reactions += $item } }
+            if (@($reactions | Where-Object {
+                [string]$_.content -eq "+1" -and [string]$_.user.login -match '^(chatgpt-codex-connector|codex)(\[bot\])?$'
+            }).Count -gt 0) {
+                $codexCleanPass = $true
+                break
+            }
+        }
+    }
+    $codexCompleted = ($codexReviews.Count -gt 0 -or $codexCleanPass)
     $elapsedForHead = ([DateTimeOffset]::Now - $headSeenAt).TotalSeconds
-    if (-not $NoTriggerCodex -and $codexReviews.Count -eq 0 -and -not $alreadyTriggered -and $elapsedForHead -ge $CodexGraceSec) {
+    if (-not $NoTriggerCodex -and -not $codexCompleted -and -not $alreadyTriggered -and $elapsedForHead -ge $CodexGraceSec) {
         $commentBody = "@codex review`n`n$marker"
         $oldPreference = $ErrorActionPreference
         $ErrorActionPreference = "Continue"
@@ -116,13 +131,14 @@ while ([DateTimeOffset]::Now -lt $deadline) {
         pr_number = $PrNumber
         url = [string]$pr.url
         head_sha = $headSha
-        codex_reviewed_current_head = ($codexReviews.Count -gt 0)
+        codex_reviewed_current_head = $codexCompleted
+        codex_clean_pass_current_head = $codexCleanPass
         codex_triggered_current_head = $alreadyTriggered
         checks_total = $checks.Count
         checks_pending = $pendingChecks.Count
         checks_failed = $failedChecks.Count
         unresolved_threads = $unresolved.Count
-        ready = ($codexReviews.Count -gt 0 -and $pendingChecks.Count -eq 0 -and $failedChecks.Count -eq 0 -and $unresolved.Count -eq 0)
+        ready = ($codexCompleted -and $pendingChecks.Count -eq 0 -and $failedChecks.Count -eq 0 -and $unresolved.Count -eq 0)
     }
 
     if ($failedChecks.Count -gt 0) {

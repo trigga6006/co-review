@@ -33,10 +33,6 @@ if ([int]$meta.max_turns -gt 0 -and (Test-Path -LiteralPath $statePath -PathType
     }
 }
 
-if (-not $NoEnsure) {
-    & (Join-Path $PSScriptRoot "ensure-pair.ps1") -PairId $PairId -Json | Out-Null
-}
-
 if ($TurnTimeoutSec -lt 0) {
     throw "TurnTimeoutSec must be greater than zero when specified"
 }
@@ -74,14 +70,24 @@ try {
         exit 2
     }
 
-    if (-not $Queue) {
-        # The journals are authoritative. This also reconciles schema-v1 state
-        # and a sender crash between reserving an id and appending its request.
-        $pendingIds = @(Get-CoReviewPendingRequestIds -RequestPath $toCodex -ReplyPath (Join-Path $pairDir "to-claude.jsonl"))
-        $pendingCount = $pendingIds.Count
-        if ($pendingCount -gt 0) {
-            throw "Worker $PairId is busy or already queued ($pendingCount pending). Wait/cancel it, or pass -Queue to enqueue intentionally."
+    # The journals are authoritative. This also reconciles schema-v1 state
+    # and a sender crash between reserving an id and appending its request.
+    $pendingIds = @(Get-CoReviewPendingRequestIds -RequestPath $toCodex -ReplyPath (Join-Path $pairDir "to-claude.jsonl"))
+    $pendingCount = $pendingIds.Count
+    if ([int]$meta.max_turns -gt 0) {
+        $completedTurns = 0
+        if (Test-Path -LiteralPath $statePath -PathType Leaf) {
+            try {
+                $latestState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -ErrorAction Stop
+                if ($null -ne $latestState.PSObject.Properties["completed_turns"]) { $completedTurns = [int]$latestState.completed_turns }
+            } catch {}
         }
+        if (($completedTurns + $pendingCount) -ge [int]$meta.max_turns) {
+            throw "Worker $PairId has no unreserved turn budget remaining ($completedTurns completed, $pendingCount active or queued, limit $($meta.max_turns)). Start a fresh worker instead of queueing work that cannot run."
+        }
+    }
+    if (-not $Queue -and $pendingCount -gt 0) {
+        throw "Worker $PairId is busy or already queued ($pendingCount pending). Wait/cancel it, or pass -Queue to enqueue intentionally."
     }
 
     [long]$cnt = 0
@@ -113,6 +119,22 @@ try {
 } finally {
     if ($locked) { $mutex.ReleaseMutex() | Out-Null }
     $mutex.Dispose()
+}
+
+if (-not $NoEnsure) {
+    # Ensure after the durable append. If an idle listener retired while this
+    # sender was arriving, the request is already visible when recovery starts.
+    $pendingAfterAppend = @(Get-CoReviewPendingRequestIds -RequestPath $toCodex -ReplyPath (Join-Path $pairDir "to-claude.jsonl"))
+    if ($pendingAfterAppend -contains $msgId) {
+        try {
+            & (Join-Path $PSScriptRoot "ensure-pair.ps1") -PairId $PairId -Json | Out-Null
+        } catch {
+            # A fast final turn can publish its reply and retire between the
+            # pending check and ensure. Suppress only that proven-complete race.
+            $stillPending = @(Get-CoReviewPendingRequestIds -RequestPath $toCodex -ReplyPath (Join-Path $pairDir "to-claude.jsonl")) -contains $msgId
+            if ($stillPending) { throw }
+        }
+    }
 }
 
 Write-Output $msgId

@@ -34,11 +34,15 @@ Invoke-WithCoReviewMutex -Name $mutexName -ScriptBlock {
     $activePath = Join-Path $pairDir "active-turn.json"
     $cancellationUnconfirmed = $false
     if (Test-Path -LiteralPath $activePath -PathType Leaf) {
+        $active = $null
         try {
             $active = Get-Content -LiteralPath $activePath -Raw | ConvertFrom-Json
             $cancelResult = & (Join-Path $PSScriptRoot "cancel-worker.ps1") -WorkerId $PairId -MessageId ([string]$active.message_id) -Json | ConvertFrom-Json
             $cancellationUnconfirmed = ([string]$cancelResult.status -eq "cancellation-unconfirmed")
         } catch {
+            if ($null -eq $active -or ([string]$active.backend -eq "app-server" -and [string]$active.connection_mode -eq "shared")) {
+                $cancellationUnconfirmed = $true
+            }
             Write-Warning "Could not stop active Codex turn cleanly: $($_.Exception.Message)"
         }
     }

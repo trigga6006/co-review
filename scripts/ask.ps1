@@ -61,10 +61,20 @@ try {
         }
         if ($reply) { break }
         if ((Get-Date) -ge $deadline) {
+            $cancelResult = $null
+            $cancelError = ""
             if (-not $LeaveRunning) {
-                try { & (Join-Path $scriptDir "cancel-worker.ps1") -WorkerId $PairId -MessageId $msgId -Json | Out-Null } catch {}
+                try { $cancelResult = & (Join-Path $scriptDir "cancel-worker.ps1") -WorkerId $PairId -MessageId $msgId -Json | ConvertFrom-Json }
+                catch { $cancelError = $_.Exception.Message }
             }
-            $suffix = if ($LeaveRunning) { " The Codex turn was left running." } else { " The Codex turn was cancelled to prevent hidden background work." }
+            $suffix = if ($LeaveRunning) {
+                " The Codex turn was left running."
+            } elseif (-not [string]::IsNullOrWhiteSpace($cancelError) -or [string]$cancelResult.status -eq "cancellation-unconfirmed") {
+                $detail = if ([string]::IsNullOrWhiteSpace($cancelError)) { "the shared turn has not supplied an interruptible turn id" } else { $cancelError }
+                " Cancellation is unconfirmed ($detail). The bounded listener remains responsible for interrupting or timing out the turn; it was not killed or reported as cancelled."
+            } else {
+                " Cancellation was requested to prevent hidden background work (status=$([string]$cancelResult.status))."
+            }
             throw "Timeout after ${TimeoutSec}s waiting for reply to $msgId.$suffix"
         }
         $remainingMs = [int][Math]::Max(1, ($deadline - (Get-Date)).TotalMilliseconds)

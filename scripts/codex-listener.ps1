@@ -552,9 +552,24 @@ while ($true) {
     if ($newMsgs.Count -eq 0 -and [int]$meta.idle_timeout_sec -gt 0) {
         $idleSeconds = ([DateTimeOffset]::Now - $lastActivityAt).TotalSeconds
         if ($idleSeconds -ge [int]$meta.idle_timeout_sec) {
-            Write-Host "[co-review] Idle timeout reached. Retiring worker." -ForegroundColor Yellow
-            Write-Log "Idle timeout reached after $([int]$idleSeconds)s; listener retiring."
-            break
+            # Serialize the final recheck with request append. Closing resources
+            # (including listener.pid and the writer lease) inside the send lock
+            # guarantees a sender either becomes visible here or restarts us.
+            $idleDecision = Invoke-WithCoReviewMutex -Name "Global\co-review-$PairId-send" -TimeoutMs 30000 -ScriptBlock {
+                $freshState = Get-State
+                $freshMessages = @(Read-NewIncoming -LastId $freshState.last_processed -Offset ([long]$freshState.inbox_offset))
+                if ($freshMessages.Count -gt 0) {
+                    return [PSCustomObject]@{ retire=$false; messages=$freshMessages }
+                }
+                Close-CoReviewListenerResources
+                return [PSCustomObject]@{ retire=$true; messages=@() }
+            }
+            if ($idleDecision.retire) {
+                Write-Host "[co-review] Idle timeout reached. Retiring worker." -ForegroundColor Yellow
+                Write-Log "Idle timeout reached after $([int]$idleSeconds)s; listener retiring."
+                break
+            }
+            $newMsgs = @($idleDecision.messages)
         }
     }
 

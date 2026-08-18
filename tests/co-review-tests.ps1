@@ -888,7 +888,8 @@ function Test-SkillCommandContracts {
     $newWorker = Get-Content -LiteralPath (Join-Path $Scripts "new-worker.ps1") -Raw
     Assert-True ($newWorker -match 'MaxConcurrentWorkers = 32') "new-worker should default to the widened 32-worker soft cap"
     $prGate = Get-Content -LiteralPath (Join-Path $Scripts "wait-pr-review.ps1") -Raw
-    Assert-True ($prGate -match 'threadCursor' -and $prGate -match 'pageInfo' -and $prGate -match '--paginate') "PR gate should paginate reviews, comments, and review threads"
+    Assert-True ($prGate -match 'threadCursor' -and $prGate -match 'pageInfo' -and $prGate -match '--paginate') "PR gate should paginate reviews, comments, reactions, and review threads"
+    Assert-True ($prGate -match 'reactions\?per_page=100' -and $prGate -match 'codexCleanPass') "PR gate should accept Codex's authenticated thumbs-up as a current-head clean pass"
     Assert-True ($prGate -match 'latestPr' -and $prGate -match 'latestPr\.headRefOid -ne \$headSha') "PR gate should revalidate the head immediately before readiness"
     $appServer = Get-Content -LiteralPath (Join-Path $Scripts "app-server.ps1") -Raw
     $preStartMarker = $appServer.IndexOf('[System.IO.File]::WriteAllText($ActiveTurnFile')
@@ -899,6 +900,13 @@ function Test-SkillCommandContracts {
     $terminalPublish = $listener.LastIndexOf('$rid = Append-Reply')
     $markerClear = $listener.LastIndexOf('Remove-Item -LiteralPath $activeTurnFile')
     Assert-True ($durableBoundary -ge 0 -and $durableBoundary -lt $terminalPublish -and $terminalPublish -lt $markerClear) "listener should persist completion before publishing a terminal reply and clearing recovery state"
+    $send = Get-Content -LiteralPath (Join-Path $Scripts "send.ps1") -Raw
+    Assert-True ($send.IndexOf('AppendAllText($toCodex') -lt $send.LastIndexOf('ensure-pair.ps1')) "send should durably append before ensuring a listener so idle-boundary requests can restart it"
+    Assert-True ($listener -match 'Global\\co-review-\$PairId-send' -and $listener -match 'Close-CoReviewListenerResources') "idle retirement should serialize its final inbox recheck and listener teardown with send"
+    $ask = Get-Content -LiteralPath (Join-Path $Scripts "ask.ps1") -Raw
+    Assert-True ($ask -match 'cancellation-unconfirmed' -and $ask -match 'was not killed or reported as cancelled') "synchronous asks should surface unconfirmed cancellation"
+    $endPair = Get-Content -LiteralPath (Join-Path $Scripts "end-pair.ps1") -Raw
+    Assert-True ($endPair -match '\$null -eq \$active' -and $endPair -match 'connection_mode -eq "shared"' -and $endPair -match '\$cancellationUnconfirmed = \$true') "end-pair should preserve the listener after shared or unknown cancellation failures"
     Assert-True ($skill -match 'select `imagegen`' -and $skill -match "Do not claim otherwise based on stale product knowledge") "SKILL.md should select imagegen directly and reject stale capability assumptions"
     Assert-True ($skill -match "Actually call|actual image-generation tool call") "SKILL.md should require image generation rather than a prompt-only response"
     Assert-True ($skill -notmatch "Spawn at most one pair per Claude conversation") "obsolete one-pair restriction should be removed"
@@ -995,6 +1003,22 @@ function Test-SharedStartCancellationIsExplicit {
         $cancelled = & (Join-Path $Scripts "cancel-worker.ps1") -WorkerId $pair.pair_id -MessageId msg-0001 -TurnIdWaitSec 1 -Json | ConvertFrom-Json
         Assert-True ($cancelled.status -eq "cancellation-unconfirmed" -and $cancelled.active_process_stopped -eq $false) "cancelling a shared turn before its id arrives must not issue an empty interrupt or report success"
         Remove-Item -LiteralPath $activePath -Force
+    } finally {
+        if ($null -ne $pair -and (Test-Path -LiteralPath $pair.pair_dir)) { & (Join-Path $Scripts "end-pair.ps1") -PairId $pair.pair_id -Delete | Out-Null }
+        Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-TurnBudgetAccountsForPendingWork {
+    $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("co-review-turn-budget-" + [System.Guid]::NewGuid().ToString("N"))
+    $fakeCodex = New-FakeCodex -Directory $tempRoot
+    $pair = $null
+    try {
+        $pair = (& (Join-Path $Scripts "new-pair.ps1") -NoSpawn -Task "bounded queue" -CodexBin $fakeCodex -CodexModel configured-default -CodexReasoning auto -MaxTurns 1 | Select-Object -Last 1) | ConvertFrom-Json
+        $first = & (Join-Path $Scripts "send.ps1") -PairId $pair.pair_id -Message "uses the only turn" -NoEnsure | Select-Object -Last 1
+        $queued = Invoke-ScriptExpectFailure -ScriptName "send.ps1" -ScriptArgs @("-PairId",$pair.pair_id,"-Message","must not strand","-Queue","-NoEnsure")
+        Assert-True ($first -eq "msg-0001") "the first request should reserve the bounded worker turn"
+        Assert-True ($queued.ExitCode -ne 0 -and $queued.Output -match "no unreserved turn budget") "queued requests should count in-flight work against max_turns"
     } finally {
         if ($null -ne $pair -and (Test-Path -LiteralPath $pair.pair_dir)) { & (Join-Path $Scripts "end-pair.ps1") -PairId $pair.pair_id -Delete | Out-Null }
         Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
@@ -1293,6 +1317,7 @@ $TestGroups = [ordered]@{
     LatencyControls = {
         Test-LatencyControls
         Test-SharedStartCancellationIsExplicit
+        Test-TurnBudgetAccountsForPendingWork
     }
     OwnerCleanup = { Test-OwnerCleanup }
     SendSequenceRecovery = { Test-SendSequenceRecovery }

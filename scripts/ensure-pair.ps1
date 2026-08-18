@@ -7,6 +7,10 @@ $mutexName = Get-CoReviewMutexName -Scope "lifecycle" -Key $PairId
 $result = Invoke-WithCoReviewMutex -Name $mutexName -ScriptBlock {
     $meta = Get-NormalizedPairMetadata -PairDir $pairDir
     $statePath = Join-Path $pairDir "state.json"
+    $listenerPid = $null
+    if (Test-CoReviewListenerAlive -PairDir $pairDir -ListenerPid ([ref]$listenerPid)) {
+        return [PSCustomObject]@{ worker_id=$PairId; pair_id=$PairId; status="active"; restarted=$false; listener_pid=$listenerPid; pair_dir=$pairDir }
+    }
     if ([int]$meta.max_turns -gt 0 -and (Test-Path -LiteralPath $statePath -PathType Leaf)) {
         $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
         $completedTurns = if ($null -ne $state.PSObject.Properties["completed_turns"]) { [int]$state.completed_turns } else { 0 }
@@ -14,11 +18,6 @@ $result = Invoke-WithCoReviewMutex -Name $mutexName -ScriptBlock {
             throw "Worker $PairId reached its turn limit ($($meta.max_turns)) and has retired. Start a fresh worker for a new responsibility."
         }
     }
-    $listenerPid = $null
-    if (Test-CoReviewListenerAlive -PairDir $pairDir -ListenerPid ([ref]$listenerPid)) {
-        return [PSCustomObject]@{ worker_id=$PairId; pair_id=$PairId; status="active"; restarted=$false; listener_pid=$listenerPid; pair_dir=$pairDir }
-    }
-
     $leaseAcquired = $false
     try {
         if ([string]$meta.mode -in @("workhorse", "imagegen")) {
