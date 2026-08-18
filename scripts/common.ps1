@@ -6,10 +6,159 @@ function Get-CoReviewRoot {
 
 function Assert-ValidPairId {
     param([Parameter(Mandatory=$true)][string]$PairId)
-    if ($PairId -notmatch '^pair-\d{8}-\d{6}-[0-9a-f]{4}$') {
-        Write-Error "Invalid PairId '$PairId'. Expected format: pair-YYYYMMDD-HHMMSS-xxxx"
+    if ($PairId -notmatch '^pair-\d{8}-\d{6}-[0-9a-f]{4,16}$') {
+        Write-Error "Invalid PairId '$PairId'. Expected format: pair-YYYYMMDD-HHMMSS-<hex>"
         exit 1
     }
+}
+
+function Get-CoReviewSignalName {
+    param(
+        [Parameter(Mandatory=$true)][string]$PairId,
+        [Parameter(Mandatory=$true)][ValidateSet("inbox", "outbox")][string]$Channel
+    )
+    Assert-ValidPairId -PairId $PairId
+    return "Global\co-review-$Channel-$PairId"
+}
+
+function Open-CoReviewSignal {
+    param(
+        [Parameter(Mandatory=$true)][string]$PairId,
+        [Parameter(Mandatory=$true)][ValidateSet("inbox", "outbox")][string]$Channel
+    )
+    $created = $false
+    return [System.Threading.EventWaitHandle]::new(
+        $false,
+        [System.Threading.EventResetMode]::AutoReset,
+        (Get-CoReviewSignalName -PairId $PairId -Channel $Channel),
+        [ref]$created
+    )
+}
+
+function Signal-CoReviewChannel {
+    param(
+        [Parameter(Mandatory=$true)][string]$PairId,
+        [Parameter(Mandatory=$true)][ValidateSet("inbox", "outbox")][string]$Channel
+    )
+    $signal = Open-CoReviewSignal -PairId $PairId -Channel $Channel
+    try { [void]$signal.Set() } finally { $signal.Dispose() }
+}
+
+function Wait-CoReviewChannel {
+    param(
+        [Parameter(Mandatory=$true)]$Signal,
+        [int]$TimeoutMilliseconds = 2000
+    )
+    if ($TimeoutMilliseconds -lt 0) { $TimeoutMilliseconds = 0 }
+    return $Signal.WaitOne($TimeoutMilliseconds)
+}
+
+function Get-CoReviewSequencePath {
+    param(
+        [Parameter(Mandatory=$true)][string]$PairDir,
+        [Parameter(Mandatory=$true)][ValidateSet("inbox", "outbox")][string]$Channel
+    )
+    return (Join-Path $PairDir ".$Channel.seq")
+}
+
+function Get-CoReviewSequence {
+    param(
+        [Parameter(Mandatory=$true)][string]$PairDir,
+        [Parameter(Mandatory=$true)][ValidateSet("inbox", "outbox")][string]$Channel,
+        [string]$FallbackQueuePath = ""
+    )
+    $path = Get-CoReviewSequencePath -PairDir $PairDir -Channel $Channel
+    [long]$value = 0
+    if (Test-Path -LiteralPath $path -PathType Leaf) {
+        [void][long]::TryParse(([System.IO.File]::ReadAllText($path)).Trim(), [ref]$value)
+        return $value
+    }
+    if (-not [string]::IsNullOrWhiteSpace($FallbackQueuePath) -and (Test-Path -LiteralPath $FallbackQueuePath -PathType Leaf)) {
+        $value = @([System.IO.File]::ReadLines($FallbackQueuePath) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count
+    }
+    return $value
+}
+
+function Get-NextCoReviewSequence {
+    param(
+        [Parameter(Mandatory=$true)][string]$PairId,
+        [Parameter(Mandatory=$true)][string]$PairDir,
+        [Parameter(Mandatory=$true)][ValidateSet("inbox", "outbox")][string]$Channel,
+        [string]$FallbackQueuePath = ""
+    )
+    $mutexName = Get-CoReviewMutexName -Scope "sequence-$Channel" -Key $PairId
+    return Invoke-WithCoReviewMutex -Name $mutexName -ScriptBlock {
+        [long]$next = (Get-CoReviewSequence -PairDir $PairDir -Channel $Channel -FallbackQueuePath $FallbackQueuePath) + 1
+        $path = Get-CoReviewSequencePath -PairDir $PairDir -Channel $Channel
+        [System.IO.File]::WriteAllText($path, [string]$next, [System.Text.UTF8Encoding]::new($false))
+        return $next
+    }
+}
+
+function Get-CoReviewPendingRequestIds {
+    param(
+        [Parameter(Mandatory=$true)][string]$RequestPath,
+        [Parameter(Mandatory=$true)][string]$ReplyPath
+    )
+    $terminalReplies = @{}
+    if (Test-Path -LiteralPath $ReplyPath -PathType Leaf) {
+        foreach ($line in @([System.IO.File]::ReadLines($ReplyPath))) {
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            try { $reply = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+            if ([string]$reply.type -in @("response", "error") -and -not [string]::IsNullOrWhiteSpace([string]$reply.in_reply_to)) {
+                $terminalReplies[[string]$reply.in_reply_to] = $true
+            }
+        }
+    }
+    $pending = @()
+    if (Test-Path -LiteralPath $RequestPath -PathType Leaf) {
+        foreach ($line in @([System.IO.File]::ReadLines($RequestPath))) {
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            try { $request = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+            $requestId = [string]$request.id
+            if (-not [string]::IsNullOrWhiteSpace($requestId) -and -not $terminalReplies.ContainsKey($requestId)) { $pending += $requestId }
+        }
+    }
+    return @($pending)
+}
+
+function Read-CoReviewJsonlTail {
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [long]$Offset = 0
+    )
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return [PSCustomObject]@{ records=@(); next_offset=$Offset; file_length=0 }
+    }
+    $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+    try {
+        if ($Offset -lt 0 -or $Offset -gt $stream.Length) { $Offset = 0 }
+        [void]$stream.Seek($Offset, [System.IO.SeekOrigin]::Begin)
+        $remaining = [int]($stream.Length - $Offset)
+        if ($remaining -le 0) { return [PSCustomObject]@{ records=@(); next_offset=$Offset; file_length=$stream.Length } }
+        $bytes = New-Object byte[] $remaining
+        $read = $stream.Read($bytes, 0, $remaining)
+        $lastNewline = -1
+        for ($i = $read - 1; $i -ge 0; $i--) {
+            if ($bytes[$i] -eq 10) { $lastNewline = $i; break }
+        }
+        if ($lastNewline -lt 0) { return [PSCustomObject]@{ records=@(); next_offset=$Offset; file_length=$stream.Length } }
+        $text = [System.Text.Encoding]::UTF8.GetString($bytes, 0, $lastNewline + 1)
+        $records = New-Object System.Collections.Generic.List[object]
+        [long]$cursor = $Offset
+        foreach ($line in @($text -split "`n")) {
+            $lineBytes = [System.Text.Encoding]::UTF8.GetByteCount($line) + 1
+            $cursor += $lineBytes
+            $clean = $line.TrimEnd("`r")
+            if ([string]::IsNullOrWhiteSpace($clean)) { continue }
+            try {
+                $records.Add([PSCustomObject]@{ value=($clean | ConvertFrom-Json -ErrorAction Stop); end_offset=$cursor }) | Out-Null
+            } catch {
+                $records.Add([PSCustomObject]@{ value=$null; end_offset=$cursor; malformed=$true }) | Out-Null
+            }
+        }
+        return [PSCustomObject]@{ records=$records.ToArray(); next_offset=($Offset + $lastNewline + 1); file_length=$stream.Length }
+    } finally { $stream.Dispose() }
 }
 
 function Get-PairDir {
@@ -44,6 +193,15 @@ function Assert-ValidCodexBin {
         Write-Error "Invalid CodexBin '$CodexBin'. Expected an executable named codex.exe or codex."
         exit 1
     }
+}
+
+function Get-CoReviewFanoutTiers {
+    return @(
+        [PSCustomObject]@{ name="light"; workhorses=1; reviewers=1; description="One focused implementation stream with one final reviewer" },
+        [PSCustomObject]@{ name="medium"; workhorses=2; reviewers=1; description="Two independent implementation streams with one integration reviewer" },
+        [PSCustomObject]@{ name="high"; workhorses=5; reviewers=2; description="Broad multi-area work with correctness and integration reviewers" },
+        [PSCustomObject]@{ name="xhigh"; workhorses=10; reviewers=3; description="Repo-wide work with an explicit decomposition and integration plan" }
+    )
 }
 
 function Resolve-CodexBin {
@@ -221,8 +379,11 @@ function Get-CodexCapabilities {
         cli_version = $cliVersion
         models = @($models)
         modes = @("review", "workhorse", "imagegen")
+        fanout_tiers = @(Get-CoReviewFanoutTiers)
+        global_worker_soft_cap = 32
         sandboxes = @("read-only", "workspace-write", "danger-full-access")
         isolation = @("auto", "shared", "worktree")
+        transports = @("auto", "app-server", "legacy")
         window_modes = @("Hidden", "Minimized", "Foreground")
         defaults = [PSCustomObject]@{
             model = $defaultModel
@@ -231,6 +392,8 @@ function Get-CodexCapabilities {
             sandbox = "read-only"
             isolation = "auto"
             window_mode = "Hidden"
+            fanout_tier = "light"
+            transport = "auto"
         }
     }
 }
@@ -459,8 +622,11 @@ function Get-NormalizedPairMetadata {
         $meta | Add-Member -NotePropertyName search_enabled -NotePropertyValue $false -Force
         $meta | Add-Member -NotePropertyName config_overrides -NotePropertyValue @() -Force
         $meta | Add-Member -NotePropertyName max_turns -NotePropertyValue 0 -Force
+        $meta | Add-Member -NotePropertyName idle_timeout_sec -NotePropertyValue 0 -Force
         $meta | Add-Member -NotePropertyName max_progress_updates -NotePropertyValue 0 -Force
         $meta | Add-Member -NotePropertyName progress_min_interval_sec -NotePropertyValue 30 -Force
+        $meta | Add-Member -NotePropertyName transport -NotePropertyValue "auto" -Force
+        $meta | Add-Member -NotePropertyName owner_id -NotePropertyValue "legacy" -Force
     }
     if ([string]::IsNullOrWhiteSpace([string]$meta.worker_name)) {
         $meta | Add-Member -NotePropertyName worker_name -NotePropertyValue ([string]$meta.pair_id) -Force
@@ -470,11 +636,22 @@ function Get-NormalizedPairMetadata {
         # workers get a bounded default through new-worker.ps1.
         $meta | Add-Member -NotePropertyName max_turns -NotePropertyValue 0 -Force
     }
+    if ($null -eq $meta.PSObject.Properties["idle_timeout_sec"]) {
+        # Preserve old workers exactly. Newly created workers receive a bounded
+        # idle lifetime through new-pair.ps1/new-worker.ps1.
+        $meta | Add-Member -NotePropertyName idle_timeout_sec -NotePropertyValue 0 -Force
+    }
     if ($null -eq $meta.PSObject.Properties["max_progress_updates"]) {
         $meta | Add-Member -NotePropertyName max_progress_updates -NotePropertyValue 0 -Force
     }
     if ($null -eq $meta.PSObject.Properties["progress_min_interval_sec"]) {
         $meta | Add-Member -NotePropertyName progress_min_interval_sec -NotePropertyValue 30 -Force
+    }
+    if ($null -eq $meta.PSObject.Properties["transport"] -or [string]::IsNullOrWhiteSpace([string]$meta.transport)) {
+        $meta | Add-Member -NotePropertyName transport -NotePropertyValue "auto" -Force
+    }
+    if ($null -eq $meta.PSObject.Properties["owner_id"] -or [string]::IsNullOrWhiteSpace([string]$meta.owner_id)) {
+        $meta | Add-Member -NotePropertyName owner_id -NotePropertyValue "legacy" -Force
     }
     return $meta
 }
@@ -488,6 +665,40 @@ function Get-CoReviewActiveWorkerCount {
         if (Test-CoReviewListenerAlive -PairDir $dir.FullName -ListenerPid ([ref]$listenerPid)) { $count++ }
     }
     return $count
+}
+
+function Get-CoReviewReservationRoot {
+    $path = Join-Path (Get-CoReviewRoot) ".reservations"
+    New-Item -ItemType Directory -Path $path -Force | Out-Null
+    return $path
+}
+
+function Get-CoReviewPendingWorkerReservationCount {
+    $root = Get-CoReviewReservationRoot
+    $count = 0
+    foreach ($file in @(Get-ChildItem -LiteralPath $root -File -Filter "*.json" -ErrorAction SilentlyContinue)) {
+        try { $reservation = Get-Content -LiteralPath $file.FullName -Raw | ConvertFrom-Json -ErrorAction Stop } catch { $reservation = $null }
+        $valid = $false
+        if ($null -ne $reservation) {
+            [int]$ownerPid = 0
+            $created = [DateTimeOffset]::MinValue
+            $valid = [int]::TryParse([string]$reservation.owner_pid, [ref]$ownerPid) -and
+                [DateTimeOffset]::TryParse([string]$reservation.created_at, [ref]$created) -and
+                ([DateTimeOffset]::Now - $created).TotalMinutes -lt 5 -and
+                $null -ne (Get-Process -Id $ownerPid -ErrorAction SilentlyContinue)
+        }
+        if ($valid) { $count++ }
+        else { Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue }
+    }
+    return $count
+}
+
+function New-CoReviewWorkerReservation {
+    $id = [guid]::NewGuid().ToString("N")
+    $path = Join-Path (Get-CoReviewReservationRoot) "$id.json"
+    $reservation = [ordered]@{ id=$id; owner_pid=$PID; created_at=(Get-Date).ToString("o") }
+    [System.IO.File]::WriteAllText($path, ($reservation | ConvertTo-Json -Compress), [System.Text.UTF8Encoding]::new($false))
+    return $path
 }
 
 function Get-CoReviewMutexName {
@@ -602,8 +813,15 @@ function Stop-CoReviewProcessTree {
     }
     $treeIds.Add($ProcessId)
 
-    & taskkill.exe /PID $ProcessId /T /F 2>$null | Out-Null
-    $taskkillExitCode = $LASTEXITCODE
+    $taskkillExitCode = 1
+    try {
+        & taskkill.exe /PID $ProcessId /T /F 2>$null | Out-Null
+        $taskkillExitCode = $LASTEXITCODE
+    } catch {
+        # The process can exit between the initial liveness check and taskkill.
+        # The explicit remaining-process check below is authoritative.
+        $taskkillExitCode = 1
+    }
     $remainingIds = @($treeIds | Where-Object { $null -ne (Get-Process -Id $_ -ErrorAction SilentlyContinue) })
     if ($taskkillExitCode -ne 0 -or $remainingIds.Count -gt 0) {
         $killIds = @($treeIds.ToArray())

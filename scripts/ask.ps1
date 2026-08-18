@@ -23,6 +23,10 @@ $scriptDir = $PSScriptRoot
 . (Join-Path $scriptDir "common.ps1")
 $sendPath = Join-Path $scriptDir "send.ps1"
 Assert-ValidPairId -PairId $PairId
+$pairDir = Get-PairDir -PairId $PairId -MustExist
+$toClaude = Join-Path -Path $pairDir -ChildPath "to-claude.jsonl"
+[long]$outboxOffset = 0
+if (Test-Path -LiteralPath $toClaude -PathType Leaf) { $outboxOffset = (Get-Item -LiteralPath $toClaude).Length }
 
 # Invoke send.ps1 in-process via the call operator (no subshell, no exec-policy flag).
 if ($PSCmdlet.ParameterSetName -eq "File") {
@@ -37,20 +41,18 @@ if ([string]::IsNullOrWhiteSpace($msgId)) {
 
 Write-Host "[co-review] Sent $msgId. Waiting for Codex (timeout ${TimeoutSec}s)..." -ForegroundColor Cyan
 
-# Receive: scan the entire to-claude.jsonl for a reply whose in_reply_to matches our msgId.
-# This is race-free - it doesn't matter whether the reply lands before or after we start polling.
-$pairDir = Get-PairDir -PairId $PairId -MustExist
-$toClaude = Join-Path -Path $pairDir -ChildPath "to-claude.jsonl"
-
 $deadline = (Get-Date).AddSeconds($TimeoutSec)
 $reply = $null
 $seenProgress = @{}
+$signal = Open-CoReviewSignal -PairId $PairId -Channel "outbox"
 
-while ($true) {
-    if (Test-Path $toClaude) {
-        $lines = @(Get-Content $toClaude -Encoding UTF8 -ErrorAction SilentlyContinue | Where-Object { $_ -and $_.Trim() -ne "" })
-        foreach ($line in $lines) {
-            try { $obj = $line | ConvertFrom-Json } catch { continue }
+try {
+    while ($true) {
+        $tail = Read-CoReviewJsonlTail -Path $toClaude -Offset $outboxOffset
+        $outboxOffset = [long]$tail.next_offset
+        foreach ($record in @($tail.records)) {
+            $obj = $record.value
+            if ($null -eq $obj) { continue }
             if ($obj.in_reply_to -ne $msgId) { continue }
             if ($obj.type -eq "progress" -and -not $seenProgress.ContainsKey([string]$obj.id)) {
                 $seenProgress[[string]$obj.id] = $true
@@ -58,16 +60,28 @@ while ($true) {
             } elseif ($obj.type -in @("response", "error")) { $reply = $obj; break }
         }
         if ($reply) { break }
-    }
-    if ((Get-Date) -ge $deadline) {
-        if (-not $LeaveRunning) {
-            try { & (Join-Path $scriptDir "cancel-worker.ps1") -WorkerId $PairId -MessageId $msgId -Json | Out-Null } catch {}
+        if ((Get-Date) -ge $deadline) {
+            $cancelResult = $null
+            $cancelError = ""
+            if (-not $LeaveRunning) {
+                try { $cancelResult = & (Join-Path $scriptDir "cancel-worker.ps1") -WorkerId $PairId -MessageId $msgId -Json | ConvertFrom-Json }
+                catch { $cancelError = $_.Exception.Message }
+            }
+            $suffix = if ($LeaveRunning) {
+                " The Codex turn was left running."
+            } elseif (-not [string]::IsNullOrWhiteSpace($cancelError) -or [string]$cancelResult.status -eq "cancellation-unconfirmed") {
+                $detail = if ([string]::IsNullOrWhiteSpace($cancelError)) { "the shared turn has not supplied an interruptible turn id" } else { $cancelError }
+                " Cancellation is unconfirmed ($detail). The bounded listener remains responsible for interrupting or timing out the turn; it was not killed or reported as cancelled."
+            } else {
+                " Cancellation was requested to prevent hidden background work (status=$([string]$cancelResult.status))."
+            }
+            throw "Timeout after ${TimeoutSec}s waiting for reply to $msgId.$suffix"
         }
-        $suffix = if ($LeaveRunning) { " The Codex turn was left running." } else { " The Codex turn was cancelled to prevent hidden background work." }
-        throw "Timeout after ${TimeoutSec}s waiting for reply to $msgId.$suffix"
+        $remainingMs = [int][Math]::Max(1, ($deadline - (Get-Date)).TotalMilliseconds)
+        $fallbackMs = [Math]::Max(50, $PollIntervalSec * 1000)
+        [void](Wait-CoReviewChannel -Signal $signal -TimeoutMilliseconds ([Math]::Min($remainingMs, $fallbackMs)))
     }
-    Start-Sleep -Seconds $PollIntervalSec
-}
+} finally { $signal.Dispose() }
 
 if ($reply.error -and -not $AllowErrorReply) {
     throw "Codex turn $msgId failed: $($reply.error)"

@@ -19,8 +19,18 @@ $ErrorActionPreference = "Stop"
 
 $pairDir = Get-PairDir -PairId $PairId -MustExist
 
-if (-not $NoEnsure) {
-    & (Join-Path $PSScriptRoot "ensure-pair.ps1") -PairId $PairId -Json | Out-Null
+$meta = Get-NormalizedPairMetadata -PairDir $pairDir
+$statePath = Join-Path $pairDir "state.json"
+if ([int]$meta.max_turns -gt 0 -and (Test-Path -LiteralPath $statePath -PathType Leaf)) {
+    try {
+        $turnState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -ErrorAction Stop
+        $completedTurns = if ($null -ne $turnState.PSObject.Properties["completed_turns"]) { [int]$turnState.completed_turns } else { 0 }
+        if ($completedTurns -ge [int]$meta.max_turns) {
+            throw "Worker $PairId reached its turn limit ($($meta.max_turns)) and has retired. Start a fresh worker for a new responsibility."
+        }
+    } catch {
+        if ($_.Exception.Message -match "reached its turn limit") { throw }
+    }
 }
 
 if ($TurnTimeoutSec -lt 0) {
@@ -60,31 +70,31 @@ try {
         exit 2
     }
 
-    if (-not $Queue) {
-        $repliedTo = @{}
-        $toClaude = Join-Path -Path $pairDir -ChildPath "to-claude.jsonl"
-        if (Test-Path -LiteralPath $toClaude -PathType Leaf) {
-            foreach ($line in @(Get-Content -LiteralPath $toClaude -Encoding UTF8 -ErrorAction SilentlyContinue)) {
-                try { $replyObj = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
-                if ([string]$replyObj.type -in @("response", "error") -and -not [string]::IsNullOrWhiteSpace([string]$replyObj.in_reply_to)) { $repliedTo[[string]$replyObj.in_reply_to] = $true }
-            }
+    # The journals are authoritative. This also reconciles schema-v1 state
+    # and a sender crash between reserving an id and appending its request.
+    $pendingIds = @(Get-CoReviewPendingRequestIds -RequestPath $toCodex -ReplyPath (Join-Path $pairDir "to-claude.jsonl"))
+    $pendingCount = $pendingIds.Count
+    if ([int]$meta.max_turns -gt 0) {
+        $completedTurns = 0
+        if (Test-Path -LiteralPath $statePath -PathType Leaf) {
+            try {
+                $latestState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -ErrorAction Stop
+                if ($null -ne $latestState.PSObject.Properties["completed_turns"]) { $completedTurns = [int]$latestState.completed_turns }
+            } catch {}
         }
-        $pending = @()
-        if (Test-Path -LiteralPath $toCodex -PathType Leaf) {
-            foreach ($line in @(Get-Content -LiteralPath $toCodex -Encoding UTF8 -ErrorAction SilentlyContinue)) {
-                try { $requestObj = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
-                if (-not $repliedTo.ContainsKey([string]$requestObj.id)) { $pending += [string]$requestObj.id }
-            }
-        }
-        if ($pending.Count -gt 0) {
-            throw "Worker $PairId is busy or already queued ($($pending -join ', ')). Wait/cancel it, or pass -Queue to enqueue intentionally."
+        if (($completedTurns + $pendingCount) -ge [int]$meta.max_turns) {
+            throw "Worker $PairId has no unreserved turn budget remaining ($completedTurns completed, $pendingCount active or queued, limit $($meta.max_turns)). Start a fresh worker instead of queueing work that cannot run."
         }
     }
+    if (-not $Queue -and $pendingCount -gt 0) {
+        throw "Worker $PairId is busy or already queued ($pendingCount pending). Wait/cancel it, or pass -Queue to enqueue intentionally."
+    }
 
-    # Derive next id from existing line count under lock.
-    $cnt = 0
-    if (Test-Path $toCodex) {
-        $cnt = @(Get-Content $toCodex -ErrorAction SilentlyContinue | Where-Object { $_ -and $_.Trim() -ne "" }).Count
+    [long]$cnt = 0
+    foreach ($line in @([System.IO.File]::ReadLines($toCodex))) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        try { $existing = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+        if ([string]$existing.id -match '^msg-(\d+)$') { $cnt = [Math]::Max($cnt, [long]$Matches[1]) }
     }
     $cnt++
     $msgId = "msg-{0:D4}" -f $cnt
@@ -101,10 +111,30 @@ try {
     if ($TurnTimeoutSec -gt 0) { $msgObj.turn_timeout_sec = $TurnTimeoutSec }
     $msg = $msgObj | ConvertTo-Json -Compress -Depth 10
 
-    Add-Content -Path $toCodex -Value $msg -Encoding UTF8
+    # Append the durable request first. If the following sequence cache write
+    # fails, the next sender derives the id from this journal and self-heals.
+    [System.IO.File]::AppendAllText($toCodex, ($msg + [Environment]::NewLine), [System.Text.UTF8Encoding]::new($false))
+    [System.IO.File]::WriteAllText((Get-CoReviewSequencePath -PairDir $pairDir -Channel "inbox"), [string]$cnt, [System.Text.UTF8Encoding]::new($false))
+    Signal-CoReviewChannel -PairId $PairId -Channel "inbox"
 } finally {
     if ($locked) { $mutex.ReleaseMutex() | Out-Null }
     $mutex.Dispose()
+}
+
+if (-not $NoEnsure) {
+    # Ensure after the durable append. If an idle listener retired while this
+    # sender was arriving, the request is already visible when recovery starts.
+    $pendingAfterAppend = @(Get-CoReviewPendingRequestIds -RequestPath $toCodex -ReplyPath (Join-Path $pairDir "to-claude.jsonl"))
+    if ($pendingAfterAppend -contains $msgId) {
+        try {
+            & (Join-Path $PSScriptRoot "ensure-pair.ps1") -PairId $PairId -Json | Out-Null
+        } catch {
+            # A fast final turn can publish its reply and retire between the
+            # pending check and ensure. Suppress only that proven-complete race.
+            $stillPending = @(Get-CoReviewPendingRequestIds -RequestPath $toCodex -ReplyPath (Join-Path $pairDir "to-claude.jsonl")) -contains $msgId
+            if ($stillPending) { throw }
+        }
+    }
 }
 
 Write-Output $msgId

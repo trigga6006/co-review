@@ -2,7 +2,7 @@
 
 **Let Claude Code orchestrate OpenAI Codex as reviewers, workhorse sub-agents, and image-generation specialists.**
 
-`co-review` gives Claude a latency-bounded local worker manager around the Codex CLI. A bare co-review request for coding now uses a dedicated pair: GPT-5.6-Luna at high reasoning implements and verifies the change, then GPT-5.6-Sol at high reasoning reviews the stable result. Review-only, workhorse-only, and image requests remain explicit paths; image requests invoke Codex's installed `$imagegen` skill.
+`co-review` gives Claude a latency-bounded local worker manager around the Codex CLI. A bare co-review request for coding uses the Light profile: GPT-5.6-Luna at high reasoning implements and verifies the change, then GPT-5.6-Sol at high reasoning reviews the stable result. Claude can scale to Medium, High, or XHigh fan-out when the task has enough independent workstreams. Review-only, workhorse-only, and image requests remain explicit paths; image requests invoke Codex's installed `$imagegen` skill.
 
 Claude remains the sole orchestrator. Codex workers are leaf agents and cannot create an uncontrolled agent mesh.
 
@@ -26,7 +26,9 @@ User
        └─ Codex workhorse ── isolated Git worktree
 ```
 
-Each worker has a directory under `~/.cc-codex-pairs/` containing a JSONL inbox/outbox, metadata, logs, and its persisted Codex thread ID. A hidden PowerShell listener watches the queue and invokes `codex exec`/`codex exec resume` with the worker's fixed permissions.
+Each worker has a directory under `~/.cc-codex-pairs/` containing a JSONL inbox/outbox, metadata, logs, owner ID, and its persisted Codex thread ID. JSONL remains the crash-safe journal, while named events wake queue readers immediately and byte offsets avoid rescanning history.
+
+By default, hidden listeners connect independent Codex threads to one loopback app-server broker shared across Claude conversations. Sharing removes repeated CLI startup; thread IDs, queues, permissions, cancellation, and writer leases remain worker-local. If the broker is unavailable, workers fall back to a dedicated persistent stdio app-server and then legacy `codex exec`.
 
 The PowerShell process is a background worker host, not the interactive Codex TUI. Hidden listeners detach stdout/stderr into per-worker log files so the launch does not appear as a failed Claude tool use. Use `-WindowMode Minimized` or `Foreground` when you want to see its log console.
 
@@ -64,7 +66,16 @@ Tell Claude what role Codex should play:
 - “Use Codex-Spark at xhigh reasoning for this focused change.”
 - “Ask Codex for a security review, but keep it read-only.”
 
-Claude reads `SKILL.md`, discovers live capabilities, chooses or honors your requested configuration, dispatches workers, and reviews their results. The default count is exactly one workhorse and one reviewer; explicit counts override it. New workers default to five-minute turns, two total turns, up to two meaningful progress updates, and a four-worker global concurrency cap. Luna may move to xhigh for genuinely complex implementation work; max and ultra are never selected automatically.
+Claude reads `SKILL.md`, discovers live capabilities, chooses or honors your requested configuration, dispatches workers, and reviews their results. Fan-out profiles are Light (1 workhorse + 1 reviewer), Medium (2 + 1), High (5 + 2), and XHigh (10 + 3); explicit counts override them. New workers default to five-minute turns, two total turns, up to two meaningful progress updates, and a 32-worker global soft cap. Fan-out tiers are independent of model reasoning: Luna may move to xhigh reasoning only for genuinely complex implementation work; max and ultra are never selected automatically.
+
+| Fan-out tier | Workhorses | Reviewers | Intended scope |
+|---|---:|---:|---|
+| Light | 1 | 1 | Focused change; normal default |
+| Medium | 2 | 1 | Two independent implementation streams |
+| High | 5 | 2 | Broad multi-area change with an integration plan |
+| XHigh | 10 | 3 | Repo-wide work with explicit decomposition and integration ownership |
+
+Claude chooses the lowest tier supported by real independent scopes. A named tier or explicit worker/reviewer count from the user takes precedence.
 
 ## Commands
 
@@ -86,8 +97,10 @@ The command reads the installed Codex model cache instead of hardcoding model na
 ### Start a reviewer
 
 ```powershell
+$coReviewOwner = "claude-" + [guid]::NewGuid().ToString("N").Substring(0, 16)
 $reviewer = & "$coReview\new-worker.ps1" `
   -Name "auth-review" `
+  -OwnerId $coReviewOwner `
   -Mode review `
   -Task "Review the auth refactor" `
   -ProjectCwd (Get-Location).Path | Select-Object -Last 1 | ConvertFrom-Json
@@ -98,6 +111,7 @@ $reviewer = & "$coReview\new-worker.ps1" `
 ```powershell
 $worker = & "$coReview\new-worker.ps1" `
   -Name "parser-worker" `
+  -OwnerId $coReviewOwner `
   -Mode workhorse `
   -Task "Implement and test the parser" `
   -ProjectCwd (Get-Location).Path `
@@ -111,6 +125,7 @@ Reviewers use `read-only`. Workhorses and image generators use `workspace-write`
 ```powershell
 $imageWorker = & "$coReview\new-worker.ps1" `
   -Name "hero-art" `
+  -OwnerId $coReviewOwner `
   -Mode imagegen `
   -Task 'Generate the requested hero image with the $imagegen skill' `
   -ProjectCwd (Get-Location).Path `
@@ -169,11 +184,15 @@ $messageId = & "$coReview\send-worker.ps1" -WorkerId $worker.worker_id -Message 
 - `-Sandbox read-only|workspace-write|danger-full-access`
 - `-ConfirmDangerFullAccess` (required for unrestricted execution)
 - `-WindowMode Hidden|Minimized|Foreground`
+- `-Transport auto|app-server|legacy` (`auto` is the default)
+- `-OwnerId <conversation-token>` for isolating workers created by concurrent Claude conversations
 - `-TimeoutSec` (300 seconds by default) and `-MaxTurns` (2 by default; 0 is unlimited)
-- `-MaxProgressUpdates` (2 by default), `-ProgressMinIntervalSec`, `-MaxConcurrentWorkers` (4 by default), and `-AllowHighFanout`
+- `-MaxProgressUpdates` (2 by default), `-ProgressMinIntervalSec`, `-MaxConcurrentWorkers` (32 by default), and `-AllowHighFanout`
 - `-Profile`, `-AddDir`, `-Search`, and safe `-ConfigOverride key=value`
 
-Workers always run Codex with non-interactive approval policy `never` and `features.multi_agent=false`. Generic overrides cannot replace guarded model, reasoning, sandbox, approval, working-directory, output, session, or multi-agent values.
+Workers always run Codex with non-interactive approval policy `never` and a leaf-worker contract that prohibits nested agents. Legacy execution also forces `features.multi_agent=false`. Generic overrides cannot replace guarded model, reasoning, sandbox, approval, working-directory, output, session, or multi-agent values.
+
+Generate one owner token per Claude conversation and pass it to every worker in that conversation. `list-workers.ps1 -OwnerId <token>` returns only those workers. Global capacity remains coordinated, but one Claude thread must not reuse, cancel, or stop another thread's workers.
 
 ## Safe parallel work
 
