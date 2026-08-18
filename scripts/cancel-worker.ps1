@@ -47,11 +47,17 @@ if ($null -ne $active -and [string]$active.message_id -eq $MessageId) {
             $meta = Get-NormalizedPairMetadata -PairDir $pairDir
             Interrupt-CoReviewAppServerTurn -CodexBin ([string]$active.codex_bin) -WorkingDirectory ([string]$meta.project_cwd) -ThreadId ([string]$active.thread_id) -TurnId ([string]$active.turn_id)
             $stopped = $true
+        } elseif ([string]$active.phase -eq "shared-broker-stopped") {
+            $stopped = $true
         } else {
-            # Do not claim success or kill the listener while the shared broker may still
-            # be running an unaddressable turn. The shutdown/cancel markers remain durable,
-            # so the bounded listener will retire as soon as the start resolves or times out.
-            $cancellationUnconfirmed = $true
+            $brokerStopped = $false
+            try { $brokerStopped = Stop-CoReviewAppServerBrokerSafely -CodexBin ([string]$active.codex_bin) } catch {}
+            if ($brokerStopped) { $stopped = $true }
+            else {
+                # Do not claim success or kill the listener while the shared broker may still
+                # be running an unaddressable turn. The shutdown/cancel markers remain durable.
+                $cancellationUnconfirmed = $true
+            }
         }
     } else {
         [int]$processId = 0

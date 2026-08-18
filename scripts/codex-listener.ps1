@@ -494,14 +494,24 @@ function Invoke-Codex {
 Write-Log "Listener started for $PairId"
 $lastActivityAt = [DateTimeOffset]::Now
 $retireAfterBatch = $false
+$stopForUnconfirmedTurn = $false
 
 # A hard-killed listener used to leave the current request unacknowledged. On
 # restart that caused a mutating writable-worker turn to run a second time. Convert a
 # stale active-turn marker into a correlated interruption error instead.
 if (Test-Path -LiteralPath $activeTurnFile -PathType Leaf) {
+    $preserveInterruptedMarker = $false
     try {
         $interrupted = Get-Content -LiteralPath $activeTurnFile -Raw | ConvertFrom-Json
         $interruptedId = [string]$interrupted.message_id
+        if ([string]$interrupted.backend -eq "app-server" -and [string]$interrupted.connection_mode -eq "shared" -and [string]::IsNullOrWhiteSpace([string]$interrupted.turn_id) -and [string]$interrupted.phase -ne "shared-broker-stopped") {
+            $brokerStopped = $false
+            try { $brokerStopped = Stop-CoReviewAppServerBrokerSafely -CodexBin ([string]$interrupted.codex_bin) } catch {}
+            if (-not $brokerStopped) {
+                $preserveInterruptedMarker = $true
+                throw "Could not prove termination of the ID-less shared Codex turn"
+            }
+        }
         if ($interruptedId -match '^msg-\d+$') {
             $alreadyReplied = $false
             if (Test-Path -LiteralPath $toClaude) {
@@ -533,7 +543,12 @@ if (Test-Path -LiteralPath $activeTurnFile -PathType Leaf) {
     } catch {
         Write-Log "Could not recover stale active turn: $($_.Exception.Message)"
     } finally {
-        Remove-Item -LiteralPath $activeTurnFile -Force -ErrorAction SilentlyContinue
+        if (-not $preserveInterruptedMarker) { Remove-Item -LiteralPath $activeTurnFile -Force -ErrorAction SilentlyContinue }
+    }
+    if ($preserveInterruptedMarker) {
+        Write-Host "[co-review] FATAL: an ID-less shared turn may still be executing; preserving recovery state and exiting." -ForegroundColor Red
+        Close-CoReviewListenerResources
+        exit 3
     }
 }
 
@@ -667,8 +682,17 @@ while ($true) {
                 $errText = $_.Exception.Message
                 Write-Host "    EXCEPTION: $errText" -ForegroundColor Red
                 Write-Log "EXCEPTION on $($msg.id): $errText"
-                $terminalError = $errText
+                if ($errText -match '^UNCONFIRMED_SHARED_TURN:') {
+                    $stopForUnconfirmedTurn = $true
+                } else {
+                    $terminalError = $errText
+                }
             }
+        }
+
+        if ($stopForUnconfirmedTurn) {
+            Write-Log "Preserving active marker and pending request because shared-turn termination is unconfirmed"
+            break
         }
 
         # Commit the no-replay boundary before publishing the terminal reply or
@@ -696,6 +720,11 @@ while ($true) {
         if ($maxTurns -gt 0 -and [int]$state.completed_turns -ge $maxTurns) {
             $retireAfterBatch = $true
         }
+    }
+
+    if ($stopForUnconfirmedTurn) {
+        Write-Host "[co-review] Shared-turn termination is unconfirmed. Preserving state and exiting." -ForegroundColor Red
+        break
     }
 
     if ($retireAfterBatch) {

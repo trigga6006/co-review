@@ -895,6 +895,7 @@ function Test-SkillCommandContracts {
     $preStartMarker = $appServer.IndexOf('[System.IO.File]::WriteAllText($ActiveTurnFile')
     $turnStart = $appServer.IndexOf('method="turn/start"')
     Assert-True ($preStartMarker -ge 0 -and $preStartMarker -lt $turnStart) "app-server should persist the active marker before sending turn/start"
+    Assert-True ($appServer -match 'Stop-CoReviewAppServerBrokerSafely' -and $appServer -match 'UNCONFIRMED_SHARED_TURN' -and $appServer -match 'stopping-shared-broker') "ID-less shared timeouts should terminate the validated broker or preserve an unconfirmed marker"
     $listener = Get-Content -LiteralPath (Join-Path $Scripts "codex-listener.ps1") -Raw
     $durableBoundary = $listener.LastIndexOf('Save-State $state')
     $terminalPublish = $listener.LastIndexOf('$rid = Append-Reply')
@@ -903,6 +904,7 @@ function Test-SkillCommandContracts {
     $send = Get-Content -LiteralPath (Join-Path $Scripts "send.ps1") -Raw
     Assert-True ($send.IndexOf('AppendAllText($toCodex') -lt $send.LastIndexOf('ensure-pair.ps1')) "send should durably append before ensuring a listener so idle-boundary requests can restart it"
     Assert-True ($listener -match 'Global\\co-review-\$PairId-send' -and $listener -match 'Close-CoReviewListenerResources') "idle retirement should serialize its final inbox recheck and listener teardown with send"
+    Assert-True ($listener -match 'preserveInterruptedMarker' -and $listener -match 'stopForUnconfirmedTurn') "listener recovery should never commit or clear an unconfirmed shared turn"
     $ask = Get-Content -LiteralPath (Join-Path $Scripts "ask.ps1") -Raw
     Assert-True ($ask -match 'cancellation-unconfirmed' -and $ask -match 'was not killed or reported as cancelled') "synchronous asks should surface unconfirmed cancellation"
     $endPair = Get-Content -LiteralPath (Join-Path $Scripts "end-pair.ps1") -Raw
@@ -1133,6 +1135,57 @@ function Test-AppServerReadTimeoutInvalidatesDirectClient {
     }
 }
 
+function Test-ValidatedBrokerTermination {
+    . (Join-Path $Scripts "common.ps1")
+    . (Join-Path $Scripts "app-server.ps1")
+    $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("co-review-broker-stop-" + [System.Guid]::NewGuid().ToString("N"))
+    $fakeCodex = New-FakeCodex -Directory $tempRoot -SleepMs 30000
+    $endpoint = "ws://127.0.0.1:65534"
+    $process = $null
+    try {
+        $process = Start-Process -FilePath $fakeCodex -ArgumentList @("app-server","--listen",$endpoint) -WindowStyle Hidden -PassThru
+        $statePath = Get-CoReviewAppServerBrokerStatePath -CodexBin $fakeCodex
+        $state = @{pid=$process.Id;endpoint=$endpoint;codex_bin=$fakeCodex;started_at=(Get-Date).ToString("o")} | ConvertTo-Json
+        [System.IO.File]::WriteAllText($statePath, $state, [System.Text.UTF8Encoding]::new($false))
+        Assert-True (Stop-CoReviewAppServerBrokerSafely -CodexBin $fakeCodex) "validated shared broker termination should report success"
+        Assert-True ($null -eq (Get-Process -Id $process.Id -ErrorAction SilentlyContinue)) "validated broker termination should stop the exact process tree"
+        Assert-True (-not (Test-Path -LiteralPath $statePath)) "validated broker termination should remove stale broker state"
+    } finally {
+        if ($null -ne $process -and $null -ne (Get-Process -Id $process.Id -ErrorAction SilentlyContinue)) { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue }
+        if ($null -ne $process) { $process.Dispose() }
+        Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-UnconfirmedSharedTurnRecoveryPreservesState {
+    . (Join-Path $Scripts "common.ps1")
+    $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("co-review-unconfirmed-recovery-" + [System.Guid]::NewGuid().ToString("N"))
+    $fakeCodex = New-FakeCodex -Directory $tempRoot
+    $pair = $null
+    try {
+        $pair = (& (Join-Path $Scripts "new-pair.ps1") -NoSpawn -Task "preserve unconfirmed turn" -CodexBin $fakeCodex -CodexModel configured-default -CodexReasoning auto | Select-Object -Last 1) | ConvertFrom-Json
+        $messageId = & (Join-Path $Scripts "send.ps1") -PairId $pair.pair_id -Message "must remain pending" -NoEnsure | Select-Object -Last 1
+        $activePath = Join-Path $pair.pair_dir "active-turn.json"
+        $active = [ordered]@{
+            message_id=$messageId; listener_pid=999998; process_pid=0
+            backend="app-server"; connection_mode="shared"; thread_id="fake-app-thread"
+            turn_id=""; phase="cancellation-unconfirmed"; codex_bin=$fakeCodex
+            started_at=(Get-Date).ToString("o"); timeout_sec=60
+        }
+        [System.IO.File]::WriteAllText($activePath, ($active | ConvertTo-Json), [System.Text.UTF8Encoding]::new($false))
+        $listener = Start-Process powershell.exe -ArgumentList @("-NoProfile","-File",(Join-Path $Scripts "codex-listener.ps1"),"-PairId",$pair.pair_id,"-CodexBin",$fakeCodex,"-DryRun") -WindowStyle Hidden -PassThru
+        Assert-True ($listener.WaitForExit(10000) -and $listener.ExitCode -eq 3) "listener should fail closed when ID-less shared-turn termination cannot be proven"
+        $state = Get-Content -LiteralPath (Join-Path $pair.pair_dir "state.json") -Raw | ConvertFrom-Json
+        Assert-True (Test-Path -LiteralPath $activePath) "unconfirmed shared recovery should preserve the active marker"
+        Assert-True ([string]$state.last_processed -ne $messageId) "unconfirmed shared recovery should leave the request pending"
+        Assert-True (@(Get-CoReviewPendingRequestIds -RequestPath (Join-Path $pair.pair_dir "to-codex.jsonl") -ReplyPath (Join-Path $pair.pair_dir "to-claude.jsonl")) -contains $messageId) "unconfirmed shared recovery should not publish a false terminal reply"
+        Remove-Item -LiteralPath $activePath -Force
+    } finally {
+        if ($null -ne $pair -and (Test-Path -LiteralPath $pair.pair_dir)) { & (Join-Path $Scripts "end-pair.ps1") -PairId $pair.pair_id -Delete | Out-Null }
+        Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Test-InterruptedTurnRecovery {
     $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("co-review-interrupted-" + [System.Guid]::NewGuid().ToString("N"))
     $fakeCodex = New-FakeCodex -Directory $tempRoot
@@ -1324,8 +1377,12 @@ $TestGroups = [ordered]@{
     FastTransport = {
         Test-EventDrivenAndAppServerTransport
         Test-AppServerReadTimeoutInvalidatesDirectClient
+        Test-ValidatedBrokerTermination
     }
-    InterruptedTurnRecovery = { Test-InterruptedTurnRecovery }
+    InterruptedTurnRecovery = {
+        Test-InterruptedTurnRecovery
+        Test-UnconfirmedSharedTurnRecoveryPreservesState
+    }
     ProgressUpdates = { Test-ProgressUpdates }
     ConcurrencyCap = { Test-ConcurrencyCap }
     BackwardCompatibility = { Test-BackwardCompatibility }

@@ -141,6 +141,31 @@ function Ensure-CoReviewAppServerBroker {
     }
 }
 
+function Stop-CoReviewAppServerBrokerSafely {
+    param([Parameter(Mandatory=$true)][string]$CodexBin)
+    $statePath = Get-CoReviewAppServerBrokerStatePath -CodexBin $CodexBin
+    $mutex = Get-CoReviewMutexName -Scope "app-server-broker" -Key $CodexBin
+    return Invoke-WithCoReviewMutex -Name $mutex -TimeoutMs 30000 -ScriptBlock {
+        if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) { return $false }
+        try { $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -ErrorAction Stop }
+        catch { return $false }
+        [int]$brokerPid = 0
+        if (-not [int]::TryParse([string]$state.pid, [ref]$brokerPid) -or $brokerPid -le 0) { return $false }
+        $process = Get-Process -Id $brokerPid -ErrorAction SilentlyContinue
+        if ($null -eq $process) {
+            Remove-Item -LiteralPath $statePath -Force -ErrorAction SilentlyContinue
+            return $true
+        }
+        try { $cim = Get-CimInstance Win32_Process -Filter "ProcessId = $brokerPid" -ErrorAction Stop }
+        catch { return $false }
+        $commandLine = [string]$cim.CommandLine
+        if ($commandLine -notmatch 'app-server' -or $commandLine -notmatch [regex]::Escape([string]$state.endpoint)) { return $false }
+        Stop-CoReviewProcessTree -ProcessId $brokerPid
+        Remove-Item -LiteralPath $statePath -Force -ErrorAction SilentlyContinue
+        return $true
+    }
+}
+
 function Start-CoReviewAppServerProcess {
     param(
         [Parameter(Mandatory=$true)][string]$CodexBin,
@@ -187,7 +212,10 @@ function Read-CoReviewAppServerMessage {
             do {
                 $segment = [System.ArraySegment[byte]]::new($buffer)
                 try { $received = $Client.websocket.ReceiveAsync($segment, $cts.Token).GetAwaiter().GetResult() }
-                catch [System.OperationCanceledException] { throw "Codex app-server response timed out" }
+                catch [System.OperationCanceledException] {
+                    Stop-CoReviewAppServerClient -Client $Client
+                    throw "Codex app-server response timed out"
+                }
                 if ($received.MessageType -eq [System.Net.WebSockets.WebSocketMessageType]::Close) { throw "Codex app-server WebSocket closed" }
                 $stream.Write($buffer, 0, $received.Count)
             } while (-not $received.EndOfMessage)
@@ -415,7 +443,20 @@ function Invoke-CoReviewAppServerTurn {
         try { $message = Read-CoReviewAppServerMessage -Client $Client -TimeoutMilliseconds $remaining }
         catch {
             if ($_.Exception.Message -match 'timed out') {
-                if (-not [string]::IsNullOrWhiteSpace($turnId) -and (Test-CoReviewAppServerClientAlive -Client $Client)) {
+                if ([string]$Client.connection_mode -eq "shared" -and [string]::IsNullOrWhiteSpace($turnId)) {
+                    $active.phase = "stopping-shared-broker"
+                    [System.IO.File]::WriteAllText($ActiveTurnFile, ($active | ConvertTo-Json -Depth 8), [System.Text.UTF8Encoding]::new($false))
+                    Stop-CoReviewAppServerClient -Client $Client
+                    $brokerStopped = $false
+                    try { $brokerStopped = Stop-CoReviewAppServerBrokerSafely -CodexBin ([string]$Client.codex_bin) } catch {}
+                    if (-not $brokerStopped) {
+                        $active.phase = "cancellation-unconfirmed"
+                        [System.IO.File]::WriteAllText($ActiveTurnFile, ($active | ConvertTo-Json -Depth 8), [System.Text.UTF8Encoding]::new($false))
+                        throw "UNCONFIRMED_SHARED_TURN: timed out before Codex returned a turn id, and the dedicated shared broker could not be safely terminated"
+                    }
+                    $active.phase = "shared-broker-stopped"
+                    [System.IO.File]::WriteAllText($ActiveTurnFile, ($active | ConvertTo-Json -Depth 8), [System.Text.UTF8Encoding]::new($false))
+                } elseif (-not [string]::IsNullOrWhiteSpace($turnId) -and (Test-CoReviewAppServerClientAlive -Client $Client)) {
                     $Client.next_request_id = [long]$Client.next_request_id + 1
                     Write-CoReviewAppServerMessage -Client $Client -Message ([ordered]@{ id=[long]$Client.next_request_id; method="turn/interrupt"; params=[ordered]@{threadId=$ThreadId;turnId=$turnId} })
                 }

@@ -50,8 +50,8 @@ Invoke-WithCoReviewMutex -Name $mutexName -ScriptBlock {
     $deadline = (Get-Date).AddSeconds(5)
     while ((Get-Date) -lt $deadline -and (Test-CoReviewListenerAlive -PairDir $pairDir -ListenerPid ([ref]$listenerPid))) { Start-Sleep -Milliseconds 200 }
     $listenerStillAlive = Test-CoReviewListenerAlive -PairDir $pairDir -ListenerPid ([ref]$listenerPid)
-    if ($listenerStillAlive -and $cancellationUnconfirmed) {
-        throw "The shared Codex turn has not supplied an interruptible turn id yet. Shutdown is queued, and the bounded listener will retire after the turn starts or times out; refusing to orphan it by killing the listener."
+    if ($cancellationUnconfirmed) {
+        throw "The shared Codex turn could not be interrupted and its dedicated broker could not be safely terminated. Shutdown remains queued; refusing to kill the listener or remove worker state while writable work may still be executing."
     }
     if ($listenerStillAlive -and $null -ne $listenerPid) { Stop-CoReviewProcessTree -ProcessId $listenerPid }
     if ([string]$meta.mode -in @("workhorse", "imagegen")) { Release-WriterLease -PairId $PairId -WorkingDirectory ([string]$meta.project_cwd) }
